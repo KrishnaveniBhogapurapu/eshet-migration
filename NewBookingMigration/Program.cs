@@ -12,16 +12,12 @@ class Program
     private const string SCOPE = "Eshet";
     private const string OLD_COLLECTION = "Bookings";
     private const string NEW_COLLECTION = "Booking3";
-    // Configuration constants
-    private const int BATCH_SIZE = 50; // Process 50 bookings at a time
-    private const int BATCH_DELAY_MS = 100; // Delay between batches
-    
     // Log file names (without paths - paths will be generated dynamically)
-    private const string PROGRESS_FILE_NAME = "migration_progress.json";
     private const string SKIPPED_BOOKINGS_FILE_NAME = "skipped_bookings_report.txt";
-    private const string IGNORED_FIELDS_FILE_NAME = "ignored_fields_report.txt";
     private const string ERROR_BOOKINGS_FILE_NAME = "error_bookings_report.txt";
     private const string MISSING_FIELDS_FILE_NAME = "missing_fields_report.txt";
+    private const string TOTALS_MISMATCH_FILE_NAME = "totals_mismatch_report.txt";
+    private const bool FORCE_BOOKING_CREATION = true;
     
     // Static variables for current run
     private static string? _currentRunLogsDirectory;
@@ -40,44 +36,24 @@ class Program
             var cluster = await InitializeCouchbaseConnection();
             var bucket = await GetBucket(cluster);
             
-            // Get total count for progress tracking
-            var totalBookings = await GetTotalBookingCount(cluster);
-            Console.WriteLine($"Total bookings to migrate: {totalBookings}");
+            // Get all booking IDs that need migration
+            var bookingIdsToMigrate = await GetBookingIdsToMigrate(cluster);
+            Console.WriteLine($"Total bookings to migrate: {bookingIdsToMigrate.Count}");
             
-            if (totalBookings == 0)
+            if (bookingIdsToMigrate.Count == 0)
             {
                 Console.WriteLine("No bookings found to migrate.");
                 return;
             }
             
-            // Check for existing progress
-            var progress = LoadProgress();
-            var startOffset = progress?.LastProcessedOffset + 1 ?? 0;
-            
-            if (startOffset > 0)
-            {
-                Console.WriteLine($"Resuming migration from offset {startOffset}...");
-            }
-            
-            // Process bookings in batches
-            var migrationResults = await ProcessBookingsInBatches(cluster, bucket, totalBookings, startOffset, progress);
+            // Process bookings by ID
+            var migrationResults = await ProcessBookingsByIds(cluster, bucket, bookingIdsToMigrate);
             
             // Display final results
             Console.WriteLine($"\nMigration completed!");
             Console.WriteLine($"✅ Success: {migrationResults.successCount}");
             Console.WriteLine($"❌ Errors: {migrationResults.errorCount}");
             Console.WriteLine($"⚠️  Skipped (totals mismatch): {migrationResults.skippedCount}");
-            
-            // Clear progress file only on successful completion with no errors
-            if (migrationResults.errorCount == 0)
-            {
-                // ClearProgress();
-                Console.WriteLine("Progress file cleared - migration completed successfully!");
-            }
-            else
-            {
-                Console.WriteLine($"Progress file preserved - {migrationResults.errorCount} errors occurred. You can resume the migration.");
-            }
             
             // Cleanup
             await cluster.DisposeAsync();
@@ -139,164 +115,157 @@ class Program
         await bucket.WaitUntilReadyAsync(TimeSpan.FromSeconds(10));
         return bucket;
     }
-    private static async Task<List<JObject>> FetchBookings(ICluster cluster, int offset = 0, int limit = 100)
+    private static async Task<JObject?> FetchBookingById(ICluster cluster, string bookingId)
     {
-        Console.WriteLine($"Fetching bookings from Bookings table (offset: {offset}, limit: {limit})...");
-        
-        var query = $"SELECT {OLD_COLLECTION}.* FROM `{BUCKET_NAME}`.`{SCOPE}`.`{OLD_COLLECTION}` LIMIT {limit} OFFSET {offset}";
+        var query = $"SELECT {OLD_COLLECTION}.* FROM `{BUCKET_NAME}`.`{SCOPE}`.`{OLD_COLLECTION}` WHERE id = {bookingId}";
         var result = await cluster.QueryAsync<JObject>(query);
         
-        var bookings = new List<JObject>();
         await foreach (var row in result)
         {
             if (row != null && row["atlantisHotelId"] != null)
             {
-                bookings.Add(row);
+                return row;
             }
         }
         
-        Console.WriteLine($"Found {bookings.Count} bookings in this batch");
-        return bookings;
+        return null;
     }
 
-    private static async Task<int> GetTotalBookingCount(ICluster cluster)
+    private static async Task<List<string>> GetBookingIdsToMigrate(ICluster cluster)
     {
-        Console.WriteLine("Getting total booking count...");
+        Console.WriteLine("Getting booking IDs that need migration...");
         
-        var query = $"SELECT COUNT(*) as total FROM `{BUCKET_NAME}`.`{SCOPE}`.`{OLD_COLLECTION}` WHERE atlantisHotelId IS NOT NULL";
+        // Get all booking IDs from old collection
+        var query = $"SELECT id FROM `{BUCKET_NAME}`.`{SCOPE}`.`{OLD_COLLECTION}` WHERE atlantisHotelId IS NOT NULL";
+        
+        var allBookingIds = new List<string>();
         var result = await cluster.QueryAsync<JObject>(query);
         
         await foreach (var row in result)
         {
-            return row["total"]?.Value<int>() ?? 0;
+            if (row["id"] != null)
+            {
+                allBookingIds.Add(row["id"].ToString());
+            }
         }
         
-        return 0;
-    }
-
-    private static async Task<(int successCount, int errorCount, int skippedCount)> ProcessBookingsInBatches(ICluster cluster, IBucket bucket, int totalBookings, int startOffset = 0, MigrationProgress? existingProgress = null)
-    {
-        int totalSuccessCount = existingProgress?.TotalSuccessCount ?? 0;
-        int totalErrorCount = existingProgress?.TotalErrorCount ?? 0;
-        int totalSkippedCount = existingProgress?.TotalSkippedCount ?? 0;
-        int processedCount = startOffset;
-
-        Console.WriteLine($"Processing {totalBookings} bookings in batches of {BATCH_SIZE}...");
-        if (startOffset > 0)
+        Console.WriteLine($"Found {allBookingIds.Count} total bookings in old collection");
+        
+        // Get all booking IDs from new collection
+        var newQuery = $"SELECT id FROM `{BUCKET_NAME}`.`{SCOPE}`.`{NEW_COLLECTION}`";
+        var migratedIds = new HashSet<string>();
+        var newResult = await cluster.QueryAsync<JObject>(newQuery);
+        
+        await foreach (var row in newResult)
         {
-            Console.WriteLine($"Resuming from offset {startOffset} (already processed: {totalSuccessCount} success, {totalErrorCount} errors, {totalSkippedCount} skipped)");
-        }
-
-        var progress = existingProgress ?? new MigrationProgress();
-        var startTime = System.Diagnostics.Stopwatch.StartNew();
-
-        for (int offset = startOffset; offset < totalBookings; offset += BATCH_SIZE)
-        {
-            try
+            if (row["id"] != null)
             {
-                Console.WriteLine($"\n--- Processing batch {offset / BATCH_SIZE + 1} (offset: {offset}) ---");
-                
-                // Fetch current batch
-                var bookings = await FetchBookings(cluster, offset, BATCH_SIZE);
-                
-                if (bookings.Count == 0)
-                {
-                    Console.WriteLine("No more bookings to process.");
-                    break;
-                }
-
-                // Process current batch
-                var batchResults = await ProcessBookingsBatch(bucket, bookings);
-                
-                // Update totals
-                totalSuccessCount += batchResults.successCount;
-                totalErrorCount += batchResults.errorCount;
-                totalSkippedCount += batchResults.skippedCount;
-                processedCount += bookings.Count;
-
-                // Progress update with performance metrics
-                var progressPercentage = (double)processedCount / totalBookings * 100;
-                var elapsed = startTime.Elapsed;
-                var bookingsPerSecond = processedCount / elapsed.TotalSeconds;
-                var estimatedTimeRemaining = TimeSpan.FromSeconds((totalBookings - processedCount) / bookingsPerSecond);
-                
-                Console.WriteLine($"Progress: {processedCount}/{totalBookings} ({progressPercentage:F1}%)");
-                Console.WriteLine($"Performance: {bookingsPerSecond:F1} bookings/sec | Elapsed: {elapsed:hh\\:mm\\:ss} | ETA: {estimatedTimeRemaining:hh\\:mm\\:ss}");
-                Console.WriteLine($"Batch results - Success: {batchResults.successCount}, Errors: {batchResults.errorCount}, Skipped: {batchResults.skippedCount}");
-
-                // Update and save progress
-                progress.LastProcessedOffset = offset + bookings.Count - 1;
-                progress.TotalSuccessCount = totalSuccessCount;
-                progress.TotalErrorCount = totalErrorCount;
-                progress.TotalSkippedCount = totalSkippedCount;
-                progress.LastUpdated = DateTime.Now;
-                SaveProgress(progress);
-
-                // Add small delay between batches to prevent overwhelming the database
-                if (offset + BATCH_SIZE < totalBookings)
-                {
-                    await Task.Delay(BATCH_DELAY_MS);
-                }
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"❌ Error processing batch at offset {offset}: {ex.Message}");
-                totalErrorCount += BATCH_SIZE; // Assume all in this batch failed
-                processedCount += BATCH_SIZE;
+                migratedIds.Add(row["id"].ToString());
             }
         }
-
-        return (totalSuccessCount, totalErrorCount, totalSkippedCount);
+        
+        Console.WriteLine($"Found {migratedIds.Count} already migrated bookings");
+        
+        // Find bookings that need migration
+        var bookingIdsToMigrate = allBookingIds.Where(id => !migratedIds.Contains(id)).ToList();
+        
+        Console.WriteLine($"Found {bookingIdsToMigrate.Count} bookings that need migration");
+        return bookingIdsToMigrate;
     }
 
-    private static async Task<(int successCount, int errorCount, int skippedCount)> ProcessBookingsBatch(IBucket bucket, List<JObject> bookings)
+    private static async Task<(int successCount, int errorCount, int skippedCount)> ProcessBookingsByIds(ICluster cluster, IBucket bucket, List<string> bookingIds)
     {
         int successCount = 0;
         int errorCount = 0;
         int skippedCount = 0;
 
-        foreach (var oldBooking in bookings)
+        Console.WriteLine($"Processing {bookingIds.Count} bookings...");
+
+        for (int i = 0; i < bookingIds.Count; i++)
         {
             try
             {
-                var bookingId = oldBooking["id"]?.ToString() ?? "unknown";
-                Console.WriteLine($"Processing booking ID: {bookingId}");
+                var bookingId = bookingIds[i];
+                Console.WriteLine($"\n--- Processing booking {i + 1}/{bookingIds.Count}: {bookingId} ---");
                 
-                // Convert to new booking format and validate totals
-                var (newBooking, shouldInsert) = ConvertToNewBooking(oldBooking);
+                // Fetch single booking by ID
+                var booking = await FetchBookingById(cluster, bookingId);
                 
-                if (!shouldInsert)
+                if (booking == null)
                 {
-                    skippedCount++;
+                    LogErrorBooking(bookingId, new Exception($"Booking {bookingId} not found or missing atlantisHotelId"));
+                    Console.WriteLine($"Booking {bookingId} not found or missing atlantisHotelId");
+                    errorCount++;
                     continue;
                 }
+
+                // Process single booking
+                var result = await ProcessSingleBooking(bucket, booking);
                 
-                // Insert into new collection only if totals match
-                await InsertBookingToNewCollection(bucket, oldBooking, newBooking);
-                
-                successCount++;
-                Console.WriteLine($"✅ Successfully migrated booking ID: {bookingId}");
+                // Update totals
+                if (result == "success")
+                {
+                    successCount++;
+                }
+                else if (result == "skipped")
+                {
+                    skippedCount++;
+                }
+                else
+                {
+                    errorCount++;
+                }
             }
             catch (Exception ex)
             {
+                Console.WriteLine($"❌ Error processing booking {bookingIds[i]}: {ex.Message}");
                 errorCount++;
-                var bookingId = oldBooking["id"]?.ToString() ?? "unknown";
-                Console.WriteLine($"❌ Failed to migrate booking ID: {bookingId} - {ex.Message}");
-                
-                // Log error booking with full details
-                try
-                {
-                    LogErrorBooking(oldBooking, ex);
-                    Console.WriteLine($"📝 Error logged for booking ID: {bookingId}");
-                }
-                catch (Exception logEx)
-                {
-                    Console.WriteLine($"⚠️  Failed to log error for booking {bookingId}: {logEx.Message}");
-                }
             }
         }
 
         return (successCount, errorCount, skippedCount);
+    }
+
+    private static async Task<string> ProcessSingleBooking(IBucket bucket, JObject oldBooking)
+    {
+        try
+        {
+            var bookingId = oldBooking["id"]?.ToString() ?? "unknown";
+            Console.WriteLine($"Processing booking ID: {bookingId}");
+            
+            // Convert to new booking format and validate totals
+            var (newBooking, shouldInsert) = ConvertToNewBooking(oldBooking);
+            
+            if (!shouldInsert)
+            {
+                Console.WriteLine($"⚠️ Skipped booking ID: {bookingId}");
+                return "skipped";
+            }
+            
+            // Insert into new collection only if totals match
+            await InsertBookingToNewCollection(bucket, oldBooking, newBooking);
+            
+            Console.WriteLine($"✅ Successfully migrated booking ID: {bookingId}");
+            return "success";
+        }
+        catch (Exception ex)
+        {
+            var bookingId = oldBooking["id"]?.ToString() ?? "unknown";
+            Console.WriteLine($"❌ Failed to migrate booking ID: {bookingId} - {ex.Message}");
+            
+            // Log error booking with full details
+            try
+            {
+                LogErrorBooking(bookingId, ex);
+                Console.WriteLine($"📝 Error logged for booking ID: {bookingId}");
+            }
+            catch (Exception logEx)
+            {
+                Console.WriteLine($"⚠️  Failed to log error for booking {bookingId}: {logEx.Message}");
+            }
+            
+            return "error";
+        }
     }
 
     private static async Task InsertBookingToNewCollection(IBucket bucket, JObject oldBooking, JObject newBooking)
@@ -573,37 +542,45 @@ class Program
         bool clientMatches = Math.Abs(originalClientTotal - calculatedClientTotal) <= tolerance;
         
         bool totalsMatch = grossMatches && netMatches && clientMatches;
+            
+        if (!totalsMatch)
+        {
+            Console.WriteLine($"⚠️  Totals mismatch for booking ID: {oldBooking["id"]}");
+            Console.WriteLine($"   Original - Gross: {originalGrossTotal}, Net: {originalNetTotal}, Client: {originalClientTotal}");
+            Console.WriteLine($"   Calculated - Gross: {calculatedGrossTotal}, Net: {calculatedNetTotal}, Client: {calculatedClientTotal}");
+            Console.WriteLine($"   Skipping migration due to totals mismatch: {FORCE_BOOKING_CREATION.ToString()}");
+            
+            // Log totals mismatch to separate file
+            var message = "Totals mismatch- Original: Gross=" + originalGrossTotal + ", Net=" + originalNetTotal + ", Client=" + originalClientTotal + " | Calculated: Gross=" + calculatedGrossTotal + ", Net=" + calculatedNetTotal + ", Client=" + calculatedClientTotal;
+            LogTotalsMismatch(oldBooking, message);
+        }
+        var shouldSkipDueToTotalsMismatch = !totalsMatch && !FORCE_BOOKING_CREATION;
+
         
         // Check for missing fields in the new booking
         bool shouldSkipMigrationDueToMissingFields = ShouldSkipMigrationDueToMissingFields(oldBooking, newBooking);
         
         // Should insert only if totals match AND no missing fields
-        bool shouldInsert = totalsMatch && !shouldSkipMigrationDueToMissingFields;
+        bool shouldSkip = shouldSkipDueToTotalsMismatch || shouldSkipMigrationDueToMissingFields;
         
-        if (!shouldInsert)
+        if (shouldSkip)
         {
             var skipReasons = new List<string>();
-            
-            if (!totalsMatch)
+            if (shouldSkipDueToTotalsMismatch)
             {
-                var totalsMismatchReason = $"Totals mismatch - Original: Gross={originalGrossTotal}, Net={originalNetTotal}, Client={originalClientTotal} | Calculated: Gross={calculatedGrossTotal}, Net={calculatedNetTotal}, Client={calculatedClientTotal}";
-                skipReasons.Add(totalsMismatchReason);
-                Console.WriteLine($"⚠️  Totals mismatch for booking ID: {oldBooking["id"]}");
-                Console.WriteLine($"   Original - Gross: {originalGrossTotal}, Net: {originalNetTotal}, Client: {originalClientTotal}");
-                Console.WriteLine($"   Calculated - Gross: {calculatedGrossTotal}, Net: {calculatedNetTotal}, Client: {calculatedClientTotal}");
-                Console.WriteLine($"   Skipping migration due to totals mismatch");
+                var skipReason = "Totals mismatch- Original: Gross=" + originalGrossTotal + ", Net=" + originalNetTotal + ", Client=" + originalClientTotal + " | Calculated: Gross=" + calculatedGrossTotal + ", Net=" + calculatedNetTotal + ", Client=" + calculatedClientTotal;
+                skipReasons.Add(skipReason);
             }
             if (shouldSkipMigrationDueToMissingFields)
             {
-                skipReasons.Add("Missing fields in new booking structure");
-                Console.WriteLine($"⚠️  Skipping migration due to missing fields for booking ID: {oldBooking["id"]}");
+                var skipReason = "shouldSkipMigrationDueToMissingFields: " + shouldSkipMigrationDueToMissingFields.ToString();
+                skipReasons.Add(skipReason);
             }
-            
             // Log skipped booking to file
             LogSkippedBooking(oldBooking, skipReasons);
         }
         
-        return shouldInsert;
+        return !shouldSkip;
     }
 
     private static bool ShouldSkipMigrationDueToMissingFields(JObject oldBooking, JObject newBooking)
@@ -625,27 +602,13 @@ class Program
             "cancelledTime", "cancellationReason",
             
             // Fields that are mapped to rooms (handled in products)
-            "rooms",
-            "board",
-            "clientComment",
-            "hotelComment",
-
+            "rooms", "board", "clientComment", "hotelComment",
             // Fields that are mapped to services (handled in products)
             "services"
         };
 
-        // Define fields that are intentionally ignored (not mapped to new booking)
-        var ignoredFields = new HashSet<string>
-        {
-            "pelecardTransactionId",
-            "clientDue",
-            "fullPayment",
-            "subsidyDue"
-        };
-
         // Check for missing primitive fields in old booking
         var missingFields = new List<(string fieldName, string value)>();
-        var ignoredFieldsData = new List<(string fieldName, string value)>();
         
         foreach (var property in oldBooking.Properties())
         {
@@ -658,14 +621,6 @@ class Program
             // Skip if it's an object or array (these are handled separately)
             if (property.Value.Type == JTokenType.Object || property.Value.Type == JTokenType.Array)
                 continue;
-
-            // Check if this is an intentionally ignored field
-            if (ignoredFields.Contains(fieldName))
-            {
-                var value = oldBooking[fieldName]?.ToString() ?? "null";
-                ignoredFieldsData.Add((fieldName, value));
-                continue;
-            }
                 
             // Check if this primitive field exists in new booking
             if (newBooking[fieldName] == null)
@@ -675,36 +630,22 @@ class Program
             }
         }
 
-        // Store ignored fields to file (always log these, but don't skip migration)
-        if (ignoredFieldsData.Count > 0)
-        {
-            var bookingId = oldBooking["id"]?.ToString() ?? "unknown";
-            StoreIgnoredFieldsToFile(bookingId, ignoredFieldsData);
-            
-            Console.WriteLine($"📝 Ignored fields for booking ID: {bookingId}");
-            foreach (var (fieldName, value) in ignoredFieldsData)
-            {
-                Console.WriteLine($"   Ignored: {fieldName} = {value}");
-            }
-        }
+        // If no missing fields, proceed with migration
+        if (missingFields.Count == 0)
+            return false;
 
-        // Store missing fields to file if any found
-        if (missingFields.Count > 0)
+        // Store missing fields to file and determine if migration should proceed
+        var bookingId = oldBooking["id"]?.ToString() ?? "unknown";
+        var stored = StoreMissingFieldsToFile(bookingId, missingFields);
+        
+        Console.WriteLine($"🔍 Missing fields in new booking for ID: {bookingId}");
+        foreach (var (fieldName, value) in missingFields)
         {
-            var bookingId = oldBooking["id"]?.ToString() ?? "unknown";
-            var stored = StoreMissingFieldsToFile(bookingId, missingFields);
-            
-            Console.WriteLine($"🔍 Missing fields in new booking for ID: {bookingId}");
-            foreach (var (fieldName, value) in missingFields)
-            {
-                Console.WriteLine($"   Missing: {fieldName} = {value}");
-            }
-            // Has missing fields and it was stored. Hence proceed with migration
-            // If it was not stored, then skip migration
-            return !stored;
+            Console.WriteLine($"   Missing: {fieldName} = {value}");
         }
         
-        return false; // No missing fields. Hence proceed with migration
+        // If stored successfully, proceed with migration; if storage failed, skip migration
+        return !stored;
     }
 
 
@@ -745,9 +686,6 @@ class Program
             {
                 writer.WriteLine($"=== SKIPPED BOOKING ID: {bookingId} - {timestamp} ===");
                 writer.WriteLine($"Status: {oldBooking["status"]?.ToString() ?? "null"}");
-                writer.WriteLine($"Client Total: {oldBooking["clientTotal"]?.ToString() ?? "null"}");
-                writer.WriteLine($"Gross Total: {oldBooking["grossTotal"]?.ToString() ?? "null"}");
-                writer.WriteLine($"Net Total: {oldBooking["netTotal"]?.ToString() ?? "null"}");
                 writer.WriteLine($"Skip Reasons:");
                 foreach (var reason in skipReasons)
                 {
@@ -762,41 +700,35 @@ class Program
         }
     }
 
-    private static void StoreIgnoredFieldsToFile(string bookingId, List<(string fieldName, string value)> ignoredFields)
+    private static void LogTotalsMismatch(JObject oldBooking, string message)
     {
         try
         {
-            var fileName = GetLogFilePath(IGNORED_FIELDS_FILE_NAME);
+            var fileName = GetLogFilePath(TOTALS_MISMATCH_FILE_NAME);
             var timestamp = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss");
+            var bookingId = oldBooking["id"]?.ToString() ?? "unknown";
             
             using (var writer = new StreamWriter(fileName, true))
             {
-                writer.WriteLine($"=== IGNORED FIELDS - Booking ID: {bookingId} - {timestamp} ===");
-                foreach (var (fieldName, value) in ignoredFields)
-                {
-                    writer.WriteLine($"Ignored Field: {fieldName} = {value}");
-                }
+                writer.WriteLine($"=== TOTALS MISMATCH - Booking ID: {bookingId} - {timestamp} ===");
+                writer.WriteLine($"Message: {message}");
                 writer.WriteLine(); // Empty line for separation
             }
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"⚠️  Failed to write ignored fields to file: {ex.Message}");
+            Console.WriteLine($"⚠️  Failed to write totals mismatch to file: {ex.Message}");
         }
     }
 
-    private static void LogErrorBooking(JObject oldBooking, Exception ex)
+    private static void LogErrorBooking(string bookingId, Exception ex)
     {
         try
         {
-            Console.WriteLine($"🔍 Attempting to log error for booking...");
-            Console.WriteLine($"🔍 Current logs directory: {_currentRunLogsDirectory}");
-            
+
             var fileName = GetLogFilePath(ERROR_BOOKINGS_FILE_NAME);
-            Console.WriteLine($"🔍 Error log file path: {fileName}");
             
             var timestamp = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss");
-            var bookingId = oldBooking["id"]?.ToString() ?? "unknown";
             
             Console.WriteLine($"🔍 Writing error log for booking ID: {bookingId}");
             
@@ -806,10 +738,6 @@ class Program
                 writer.WriteLine($"Error Message: {ex.Message}");
                 writer.WriteLine($"Error Type: {ex.GetType().Name}");
                 writer.WriteLine($"Stack Trace: {ex.StackTrace}");
-                writer.WriteLine($"Status: {oldBooking["status"]?.ToString() ?? "null"}");
-                writer.WriteLine($"Client Total: {oldBooking["clientTotal"]?.ToString() ?? "null"}");
-                writer.WriteLine($"Gross Total: {oldBooking["grossTotal"]?.ToString() ?? "null"}");
-                writer.WriteLine($"Net Total: {oldBooking["netTotal"]?.ToString() ?? "null"}");
                 writer.WriteLine(); // Empty line for separation
             }
             
@@ -822,63 +750,6 @@ class Program
         }
     }
 
-    // Progress tracking classes and methods
-    public class MigrationProgress
-    {
-        public int LastProcessedOffset { get; set; } = -1;
-        public int TotalSuccessCount { get; set; } = 0;
-        public int TotalErrorCount { get; set; } = 0;
-        public int TotalSkippedCount { get; set; } = 0;
-        public DateTime LastUpdated { get; set; } = DateTime.Now;
-    }
-
-    private static MigrationProgress? LoadProgress()
-    {
-        try
-        {
-            var progressFilePath = GetLogFilePath(PROGRESS_FILE_NAME);
-            if (File.Exists(progressFilePath))
-            {
-                var json = File.ReadAllText(progressFilePath);
-                return Newtonsoft.Json.JsonConvert.DeserializeObject<MigrationProgress>(json);
-            }
-        }
-        catch (Exception ex)
-        {
-            Console.WriteLine($"⚠️  Could not load progress file: {ex.Message}");
-        }
-        return null;
-    }
-
-    private static void SaveProgress(MigrationProgress progress)
-    {
-        try
-        {
-            var progressFilePath = GetLogFilePath(PROGRESS_FILE_NAME);
-            var json = Newtonsoft.Json.JsonConvert.SerializeObject(progress, Newtonsoft.Json.Formatting.Indented);
-            File.WriteAllText(progressFilePath, json);
-        }
-        catch (Exception ex)
-        {
-            Console.WriteLine($"⚠️  Could not save progress file: {ex.Message}");
-        }
-    }
-
-    private static void ClearProgress()
-    {
-        try
-        {
-            var progressFilePath = GetLogFilePath(PROGRESS_FILE_NAME);
-            if (File.Exists(progressFilePath))
-            {
-                File.Delete(progressFilePath);
-            }
-        }
-        catch (Exception ex)
-        {
-            Console.WriteLine($"⚠️  Could not clear progress file: {ex.Message}");
-        }
-    }
 
     private static string GetLogFilePath(string fileName)
     {
