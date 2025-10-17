@@ -14,17 +14,27 @@ class Program
     private const string NEW_COLLECTION = "Booking3";
     // Configuration constants
     private const int BATCH_SIZE = 50; // Process 50 bookings at a time
-    private const string PROGRESS_FILE = "migration_progress.json";
-    private const string SKIPPED_BOOKINGS_FILE = "skipped_bookings_report.txt";
-    private const string IGNORED_FIELDS_FILE = "ignored_fields_report.txt";
-    private const string ERROR_BOOKINGS_FILE = "error_bookings_report.txt";
     private const int BATCH_DELAY_MS = 100; // Delay between batches
+    
+    // Log file names (without paths - paths will be generated dynamically)
+    private const string PROGRESS_FILE_NAME = "migration_progress.json";
+    private const string SKIPPED_BOOKINGS_FILE_NAME = "skipped_bookings_report.txt";
+    private const string IGNORED_FIELDS_FILE_NAME = "ignored_fields_report.txt";
+    private const string ERROR_BOOKINGS_FILE_NAME = "error_bookings_report.txt";
+    private const string MISSING_FIELDS_FILE_NAME = "missing_fields_report.txt";
+    
+    // Static variables for current run
+    private static string? _currentRunLogsDirectory;
+    private static string? _currentRunId;
 
     static async Task Main(string[] args)
     {
         try
         {
             Console.WriteLine("Starting booking migration process...");
+            
+            // Initialize logging directory for this run
+            InitializeLoggingDirectory();
             
             // Initialize Couchbase connection
             var cluster = await InitializeCouchbaseConnection();
@@ -78,6 +88,33 @@ class Program
             Console.WriteLine($"Stack trace: {ex.StackTrace}");
         }
     }
+    private static void InitializeLoggingDirectory()
+    {
+        try
+        {
+            // Create run ID with timestamp
+            _currentRunId = DateTime.Now.ToString("yyyy-MM-dd_HH-mm-ss");
+            
+            // Get project directory
+            var projectDir = Path.GetDirectoryName(Path.GetDirectoryName(Path.GetDirectoryName(AppDomain.CurrentDomain.BaseDirectory)));
+            
+            // Create logs directory structure
+            var logsBaseDir = Path.Combine(projectDir, "logs");
+            _currentRunLogsDirectory = Path.Combine(logsBaseDir, $"migration_run_{_currentRunId}");
+            
+            // Create the directory if it doesn't exist
+            Directory.CreateDirectory(_currentRunLogsDirectory);
+            
+            Console.WriteLine($"📁 Logs directory created: {_currentRunLogsDirectory}");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"⚠️  Failed to create logs directory: {ex.Message}");
+            // Fallback to current directory
+            _currentRunLogsDirectory = Directory.GetCurrentDirectory();
+        }
+    }
+
     private static async Task<ICluster> InitializeCouchbaseConnection()
     {
         Console.WriteLine("Connecting to Couchbase...");
@@ -247,7 +284,15 @@ class Program
                 Console.WriteLine($"❌ Failed to migrate booking ID: {bookingId} - {ex.Message}");
                 
                 // Log error booking with full details
-                LogErrorBooking(oldBooking, ex);
+                try
+                {
+                    LogErrorBooking(oldBooking, ex);
+                    Console.WriteLine($"📝 Error logged for booking ID: {bookingId}");
+                }
+                catch (Exception logEx)
+                {
+                    Console.WriteLine($"⚠️  Failed to log error for booking {bookingId}: {logEx.Message}");
+                }
             }
         }
 
@@ -667,8 +712,7 @@ class Program
     {
         try
         {
-            var projectDir = Path.GetDirectoryName(Path.GetDirectoryName(Path.GetDirectoryName(AppDomain.CurrentDomain.BaseDirectory)));
-            var fileName = Path.Combine(projectDir, "missing_fields_report.txt");
+            var fileName = GetLogFilePath(MISSING_FIELDS_FILE_NAME);
             var timestamp = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss");
             
             using (var writer = new StreamWriter(fileName, true))
@@ -693,8 +737,7 @@ class Program
     {
         try
         {
-            var projectDir = Path.GetDirectoryName(Path.GetDirectoryName(Path.GetDirectoryName(AppDomain.CurrentDomain.BaseDirectory)));
-            var fileName = Path.Combine(projectDir, SKIPPED_BOOKINGS_FILE);
+            var fileName = GetLogFilePath(SKIPPED_BOOKINGS_FILE_NAME);
             var timestamp = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss");
             var bookingId = oldBooking["id"]?.ToString() ?? "unknown";
             
@@ -710,7 +753,6 @@ class Program
                 {
                     writer.WriteLine($"  - {reason}");
                 }
-                writer.WriteLine($"Raw Booking Data: {oldBooking.ToString(Newtonsoft.Json.Formatting.Indented)}");
                 writer.WriteLine(); // Empty line for separation
             }
         }
@@ -724,8 +766,7 @@ class Program
     {
         try
         {
-            var projectDir = Path.GetDirectoryName(Path.GetDirectoryName(Path.GetDirectoryName(AppDomain.CurrentDomain.BaseDirectory)));
-            var fileName = Path.Combine(projectDir, IGNORED_FIELDS_FILE);
+            var fileName = GetLogFilePath(IGNORED_FIELDS_FILE_NAME);
             var timestamp = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss");
             
             using (var writer = new StreamWriter(fileName, true))
@@ -748,10 +789,16 @@ class Program
     {
         try
         {
-            var projectDir = Path.GetDirectoryName(Path.GetDirectoryName(Path.GetDirectoryName(AppDomain.CurrentDomain.BaseDirectory)));
-            var fileName = Path.Combine(projectDir, ERROR_BOOKINGS_FILE);
+            Console.WriteLine($"🔍 Attempting to log error for booking...");
+            Console.WriteLine($"🔍 Current logs directory: {_currentRunLogsDirectory}");
+            
+            var fileName = GetLogFilePath(ERROR_BOOKINGS_FILE_NAME);
+            Console.WriteLine($"🔍 Error log file path: {fileName}");
+            
             var timestamp = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss");
             var bookingId = oldBooking["id"]?.ToString() ?? "unknown";
+            
+            Console.WriteLine($"🔍 Writing error log for booking ID: {bookingId}");
             
             using (var writer = new StreamWriter(fileName, true))
             {
@@ -763,13 +810,15 @@ class Program
                 writer.WriteLine($"Client Total: {oldBooking["clientTotal"]?.ToString() ?? "null"}");
                 writer.WriteLine($"Gross Total: {oldBooking["grossTotal"]?.ToString() ?? "null"}");
                 writer.WriteLine($"Net Total: {oldBooking["netTotal"]?.ToString() ?? "null"}");
-                writer.WriteLine($"Raw Booking Data: {oldBooking.ToString(Newtonsoft.Json.Formatting.Indented)}");
                 writer.WriteLine(); // Empty line for separation
             }
+            
+            Console.WriteLine($"✅ Error log written successfully for booking ID: {bookingId}");
         }
         catch (Exception logEx)
         {
             Console.WriteLine($"⚠️  Failed to write error booking to file: {logEx.Message}");
+            Console.WriteLine($"⚠️  Stack trace: {logEx.StackTrace}");
         }
     }
 
@@ -787,9 +836,10 @@ class Program
     {
         try
         {
-            if (File.Exists(PROGRESS_FILE))
+            var progressFilePath = GetLogFilePath(PROGRESS_FILE_NAME);
+            if (File.Exists(progressFilePath))
             {
-                var json = File.ReadAllText(PROGRESS_FILE);
+                var json = File.ReadAllText(progressFilePath);
                 return Newtonsoft.Json.JsonConvert.DeserializeObject<MigrationProgress>(json);
             }
         }
@@ -804,8 +854,9 @@ class Program
     {
         try
         {
+            var progressFilePath = GetLogFilePath(PROGRESS_FILE_NAME);
             var json = Newtonsoft.Json.JsonConvert.SerializeObject(progress, Newtonsoft.Json.Formatting.Indented);
-            File.WriteAllText(PROGRESS_FILE, json);
+            File.WriteAllText(progressFilePath, json);
         }
         catch (Exception ex)
         {
@@ -817,14 +868,24 @@ class Program
     {
         try
         {
-            if (File.Exists(PROGRESS_FILE))
+            var progressFilePath = GetLogFilePath(PROGRESS_FILE_NAME);
+            if (File.Exists(progressFilePath))
             {
-                File.Delete(PROGRESS_FILE);
+                File.Delete(progressFilePath);
             }
         }
         catch (Exception ex)
         {
             Console.WriteLine($"⚠️  Could not clear progress file: {ex.Message}");
         }
+    }
+
+    private static string GetLogFilePath(string fileName)
+    {
+        if (string.IsNullOrEmpty(_currentRunLogsDirectory))
+        {
+            throw new InvalidOperationException("Logging directory not initialized. Call InitializeLoggingDirectory() first.");
+        }
+        return Path.Combine(_currentRunLogsDirectory, fileName);
     }
 }
