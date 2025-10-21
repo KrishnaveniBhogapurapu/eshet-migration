@@ -37,24 +37,32 @@ class Program
             var cluster = await InitializeCouchbaseConnection();
             var bucket = await GetBucket(cluster);
             
-            // Get all booking IDs that need migration
-            var bookingIdsToMigrate = await GetBookingIdsToMigrate(cluster);
-            Console.WriteLine($"Total bookings to migrate: {bookingIdsToMigrate.Count}");
+            // Get all booking IDs that need migration (separated by insert/update)
+            var (insertBookings, updateBookings) = await GetBookingIdsToMigrate(cluster);
+            var totalBookings = insertBookings.Count + updateBookings.Count;
+            Console.WriteLine($"Total bookings to process: {totalBookings} (INSERT: {insertBookings.Count}, UPDATE: {updateBookings.Count})");
             
-            if (bookingIdsToMigrate.Count == 0)
+            if (totalBookings == 0)
             {
                 Console.WriteLine("No bookings found to migrate.");
                 return;
             }
             
-            // Process bookings by ID
-            var migrationResults = await ProcessBookingsByIds(cluster, bucket, bookingIdsToMigrate);
+            // Process insert bookings
+            var insertResults = await ProcessBookingsByIds(cluster, bucket, insertBookings, "INSERT");
+            Console.WriteLine($"\nInsert Migration completed!");
+            Console.WriteLine($"✅ Success: {insertResults.successCount}");
+            Console.WriteLine($"❌ Errors: {insertResults.errorCount}");
+            Console.WriteLine($"⚠️  Skipped (totals mismatch): {insertResults.skippedCount}");
+            
+            // Process update bookings
+            var updateResults = await ProcessBookingsByIds(cluster, bucket, updateBookings, "UPDATE");
             
             // Display final results
-            Console.WriteLine($"\nMigration completed!");
-            Console.WriteLine($"✅ Success: {migrationResults.successCount}");
-            Console.WriteLine($"❌ Errors: {migrationResults.errorCount}");
-            Console.WriteLine($"⚠️  Skipped (totals mismatch): {migrationResults.skippedCount}");
+            Console.WriteLine($"\nUpdate Migration completed!");
+            Console.WriteLine($"✅ Success: {updateResults.successCount}");
+            Console.WriteLine($"❌ Errors: {updateResults.errorCount}");
+            Console.WriteLine($"⚠️  Skipped (totals mismatch): {updateResults.skippedCount}");
             
             // Cleanup
             await cluster.DisposeAsync();
@@ -151,55 +159,93 @@ class Program
         return bookings;
     }
 
-    private static async Task<List<string>> GetBookingIdsToMigrate(ICluster cluster)
+    private static async Task<(List<string> insertBookings, List<string> updateBookings)> GetBookingIdsToMigrate(ICluster cluster)
     {
         Console.WriteLine("Getting booking IDs that need migration...");
         
-        // Get all booking IDs from old collection
-        var query = $"SELECT id FROM `{BUCKET_NAME}`.`{SCOPE}`.`{OLD_COLLECTION}` WHERE atlantisHotelId IS NOT NULL";
-        
-        var allBookingIds = new List<string>();
-        var result = await cluster.QueryAsync<JObject>(query);
-        
-        await foreach (var row in result)
-        {
-            if (row["id"] != null)
-            {
-                allBookingIds.Add(row["id"].ToString());
-            }
-        }
-        
-        Console.WriteLine($"Found {allBookingIds.Count} total bookings in old collection");
-        
-        // Get all booking IDs from new collection
-        var newQuery = $"SELECT id FROM `{BUCKET_NAME}`.`{SCOPE}`.`{NEW_COLLECTION}`";
-        var migratedIds = new HashSet<string>();
+        // Get all booking IDs from new collection with their updateTime
+        var newQuery = $"SELECT id, updateTime FROM `{BUCKET_NAME}`.`{SCOPE}`.`{NEW_COLLECTION}`";
+        var migratedBookings = new Dictionary<string, DateTime>();
         var newResult = await cluster.QueryAsync<JObject>(newQuery);
         
         await foreach (var row in newResult)
         {
-            if (row["id"] != null)
+            if (row != null && row["id"] != null)
             {
-                migratedIds.Add(row["id"].ToString());
+                var bookingId = row["id"].ToString();
+                DateTime updateTime = DateTime.MinValue;
+                
+                if (row["updateTime"] != null && row["updateTime"].Type != JTokenType.Null)
+                {
+                    if (DateTime.TryParse(row["updateTime"].ToString(), out var parsedTime))
+                    {
+                        updateTime = parsedTime;
+                    }
+                }
+                
+                migratedBookings[bookingId] = updateTime;
             }
         }
         
-        Console.WriteLine($"Found {migratedIds.Count} already migrated bookings");
+        Console.WriteLine($"Found {migratedBookings.Count} already migrated bookings");
         
-        // Find bookings that need migration
-        var bookingIdsToMigrate = allBookingIds.Where(id => !migratedIds.Contains(id)).ToList();
+        // Get all old bookings that need migration
+        var oldQuery = $"SELECT id, updateTime FROM `{BUCKET_NAME}`.`{SCOPE}`.`{OLD_COLLECTION}` WHERE atlantisHotelId IS NOT NULL";
+        var insertBookings = new List<string>();
+        var updateBookings = new List<string>();
         
-        Console.WriteLine($"Found {bookingIdsToMigrate.Count} bookings that need migration");
-        return bookingIdsToMigrate;
+        var oldResult = await cluster.QueryAsync<JObject>(oldQuery);
+        
+        await foreach (var row in oldResult)
+        {
+            if (row["id"] != null)
+            {
+                var bookingId = row["id"].ToString();
+                
+                if (!migratedBookings.ContainsKey(bookingId))
+                {
+                    // New booking - needs insertion
+                    insertBookings.Add(bookingId);
+                }
+                else
+                {
+                    // Existing booking - check if old version is newer
+                    DateTime oldUpdateTime = DateTime.MinValue;
+                    
+                    if (row["updateTime"] != null && row["updateTime"].Type != JTokenType.Null)
+                    {
+                        if (DateTime.TryParse(row["updateTime"].ToString(), out var parsedTime))
+                        {
+                            oldUpdateTime = parsedTime;
+                        }
+                    }
+                    
+                    var newUpdateTime = migratedBookings[bookingId];
+                    if (oldUpdateTime > newUpdateTime)
+                    {
+                        Console.WriteLine($"📝 Booking {bookingId} needs update (old: {oldUpdateTime:yyyy-MM-dd HH:mm:ss}, new: {newUpdateTime:yyyy-MM-dd HH:mm:ss})");
+                        updateBookings.Add(bookingId);
+                    }
+                }
+            }
+        }
+        
+        Console.WriteLine($"Found {insertBookings.Count} bookings to INSERT and {updateBookings.Count} bookings to UPDATE");
+        return (insertBookings, updateBookings);
     }
 
-    private static async Task<(int successCount, int errorCount, int skippedCount)> ProcessBookingsByIds(ICluster cluster, IBucket bucket, List<string> bookingIds)
+    private static async Task<(int successCount, int errorCount, int skippedCount)> ProcessBookingsByIds(ICluster cluster, IBucket bucket, List<string> bookingIds, string operationType)
     {
         int successCount = 0;
         int errorCount = 0;
         int skippedCount = 0;
 
-        Console.WriteLine($"Processing {bookingIds.Count} bookings in batches of {BATCH_SIZE}...");
+        if (bookingIds.Count == 0)
+        {
+            return (successCount, errorCount, skippedCount);
+        }
+
+        Console.WriteLine($"Processing {bookingIds.Count} bookings for {operationType} in batches of {BATCH_SIZE}...");
 
         // Process bookings in batches
         for (int batchStart = 0; batchStart < bookingIds.Count; batchStart += BATCH_SIZE)
@@ -207,7 +253,7 @@ class Program
             var batchEnd = Math.Min(batchStart + BATCH_SIZE, bookingIds.Count);
             var batchIds = bookingIds.GetRange(batchStart, batchEnd - batchStart);
             
-            Console.WriteLine($"\n=== Processing batch {batchStart / BATCH_SIZE + 1} (bookings {batchStart + 1}-{batchEnd}) ===");
+            Console.WriteLine($"\n=== Processing {operationType} batch {batchStart / BATCH_SIZE + 1} (bookings {batchStart + 1}-{batchEnd}) ===");
             
             // Fetch all bookings in this batch
             var batchBookings = await FetchBookingsBatch(cluster, batchIds);
@@ -232,8 +278,11 @@ class Program
                         continue;
                     }
 
+                    Console.WriteLine($"🔄 {operationType} operation for booking {bookingId}");
+
                     // Process single booking
-                    var result = await ProcessSingleBooking(bucket, booking);
+                    var isUpdate = operationType == "UPDATE";
+                    var result = await ProcessSingleBooking(bucket, booking, isUpdate);
                     
                     // Update totals
                     if (result == "success")
@@ -256,18 +305,20 @@ class Program
                 }
             }
             
-            Console.WriteLine($"=== Completed batch {batchStart / BATCH_SIZE + 1} ===");
+            Console.WriteLine($"=== Completed {operationType} batch {batchStart / BATCH_SIZE + 1} ===");
         }
 
         return (successCount, errorCount, skippedCount);
     }
 
-    private static async Task<string> ProcessSingleBooking(IBucket bucket, JObject oldBooking)
+
+    private static async Task<string> ProcessSingleBooking(IBucket bucket, JObject oldBooking, bool isUpdate = false)
     {
+        var operation = isUpdate ? "updating" : "migrating";
         try
         {
             var bookingId = oldBooking["id"]?.ToString() ?? "unknown";
-            Console.WriteLine($"Processing booking ID: {bookingId}");
+            Console.WriteLine($"Processing booking ID: {bookingId} ({operation})");
             
             // Convert to new booking format and validate totals
             var (newBooking, shouldInsert) = ConvertToNewBooking(oldBooking);
@@ -278,16 +329,16 @@ class Program
                 return "skipped";
             }
             
-            // Insert into new collection only if totals match
+            // Insert or update in new collection
             await InsertBookingToNewCollection(bucket, oldBooking, newBooking);
             
-            Console.WriteLine($"✅ Successfully migrated booking ID: {bookingId}");
+            Console.WriteLine($"✅ Successfully processed booking ID: {bookingId} {operation}");
             return "success";
         }
         catch (Exception ex)
         {
             var bookingId = oldBooking["id"]?.ToString() ?? "unknown";
-            Console.WriteLine($"❌ Failed to migrate booking ID: {bookingId} - {ex.Message}");
+            Console.WriteLine($"❌ Failed to process booking ID: {bookingId} {operation} - {ex.Message}");
             
             // Log error booking with full details
             try
