@@ -12,6 +12,7 @@ class Program
     private const string SCOPE = "Eshet";
     private const string OLD_COLLECTION = "Bookings";
     private const string NEW_COLLECTION = "Booking3";
+    private const int BATCH_SIZE = 200; // Process bookings in batches of 200
     // Log file names (without paths - paths will be generated dynamically)
     private const string SKIPPED_BOOKINGS_FILE_NAME = "skipped_bookings_report.txt";
     private const string ERROR_BOOKINGS_FILE_NAME = "error_bookings_report.txt";
@@ -115,20 +116,39 @@ class Program
         await bucket.WaitUntilReadyAsync(TimeSpan.FromSeconds(10));
         return bucket;
     }
-    private static async Task<JObject?> FetchBookingById(ICluster cluster, string bookingId)
+    private static async Task<Dictionary<string, JObject>> FetchBookingsBatch(ICluster cluster, List<string> bookingIds)
     {
-        var query = $"SELECT {OLD_COLLECTION}.* FROM `{BUCKET_NAME}`.`{SCOPE}`.`{OLD_COLLECTION}` WHERE id = {bookingId}";
-        var result = await cluster.QueryAsync<JObject>(query);
+        var bookings = new Dictionary<string, JObject>();
+        
+        if (bookingIds.Count == 0)
+        {
+            return bookings;
+        }
+
+        Console.WriteLine($"Fetching batch of {bookingIds.Count} bookings...");
+        
+        // Use Couchbase array parameter for proper batch query
+        // Convert string booking IDs to uint for comparison
+        var numericBookingIds = bookingIds.Select(id => uint.TryParse(id, out var numId) ? numId : (uint?)null)
+                                         .Where(id => id.HasValue)
+                                         .Select(id => id.Value)
+                                         .ToList();
+        
+        var query = $"SELECT {OLD_COLLECTION}.* FROM `{BUCKET_NAME}`.`{SCOPE}`.`{OLD_COLLECTION}` WHERE id IN $bookingIds AND atlantisHotelId IS NOT NULL";
+        
+        var result = await cluster.QueryAsync<JObject>(query, options => options.Parameter("bookingIds", numericBookingIds));
         
         await foreach (var row in result)
         {
-            if (row != null && row["atlantisHotelId"] != null)
+            if (row != null && row["id"] != null && row["atlantisHotelId"] != null)
             {
-                return row;
+                var bookingId = row["id"].ToString();
+                bookings[bookingId] = row;
             }
         }
         
-        return null;
+        Console.WriteLine($"Successfully fetched {bookings.Count} bookings from batch");
+        return bookings;
     }
 
     private static async Task<List<string>> GetBookingIdsToMigrate(ICluster cluster)
@@ -179,48 +199,64 @@ class Program
         int errorCount = 0;
         int skippedCount = 0;
 
-        Console.WriteLine($"Processing {bookingIds.Count} bookings...");
+        Console.WriteLine($"Processing {bookingIds.Count} bookings in batches of {BATCH_SIZE}...");
 
-        for (int i = 0; i < bookingIds.Count; i++)
+        // Process bookings in batches
+        for (int batchStart = 0; batchStart < bookingIds.Count; batchStart += BATCH_SIZE)
         {
-            try
+            var batchEnd = Math.Min(batchStart + BATCH_SIZE, bookingIds.Count);
+            var batchIds = bookingIds.GetRange(batchStart, batchEnd - batchStart);
+            
+            Console.WriteLine($"\n=== Processing batch {batchStart / BATCH_SIZE + 1} (bookings {batchStart + 1}-{batchEnd}) ===");
+            
+            // Fetch all bookings in this batch
+            var batchBookings = await FetchBookingsBatch(cluster, batchIds);
+            
+            // Process each booking in the batch
+            for (int i = 0; i < batchIds.Count; i++)
             {
-                var bookingId = bookingIds[i];
-                Console.WriteLine($"\n--- Processing booking {i + 1}/{bookingIds.Count}: {bookingId} ---");
-                
-                // Fetch single booking by ID
-                var booking = await FetchBookingById(cluster, bookingId);
-                
-                if (booking == null)
+                try
                 {
-                    LogErrorBooking(bookingId, new Exception($"Booking {bookingId} not found or missing atlantisHotelId"));
-                    Console.WriteLine($"Booking {bookingId} not found or missing atlantisHotelId");
-                    errorCount++;
-                    continue;
-                }
+                    var bookingId = batchIds[i];
+                    var globalIndex = batchStart + i + 1;
+                    Console.WriteLine($"\n--- Processing booking {globalIndex}/{bookingIds.Count}: {bookingId} ---");
+                    
+                    // Get booking from batch-fetched data
+                    var booking = batchBookings.ContainsKey(bookingId) ? batchBookings[bookingId] : null;
+                    
+                    if (booking == null)
+                    {
+                        LogErrorBooking(bookingId, new Exception($"Booking {bookingId} not found or missing atlantisHotelId"));
+                        Console.WriteLine($"Booking {bookingId} not found or missing atlantisHotelId");
+                        errorCount++;
+                        continue;
+                    }
 
-                // Process single booking
-                var result = await ProcessSingleBooking(bucket, booking);
-                
-                // Update totals
-                if (result == "success")
-                {
-                    successCount++;
+                    // Process single booking
+                    var result = await ProcessSingleBooking(bucket, booking);
+                    
+                    // Update totals
+                    if (result == "success")
+                    {
+                        successCount++;
+                    }
+                    else if (result == "skipped")
+                    {
+                        skippedCount++;
+                    }
+                    else
+                    {
+                        errorCount++;
+                    }
                 }
-                else if (result == "skipped")
+                catch (Exception ex)
                 {
-                    skippedCount++;
-                }
-                else
-                {
+                    Console.WriteLine($"❌ Error processing booking {batchIds[i]}: {ex.Message}");
                     errorCount++;
                 }
             }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"❌ Error processing booking {bookingIds[i]}: {ex.Message}");
-                errorCount++;
-            }
+            
+            Console.WriteLine($"=== Completed batch {batchStart / BATCH_SIZE + 1} ===");
         }
 
         return (successCount, errorCount, skippedCount);
@@ -337,8 +373,8 @@ class Program
             // For non-cancelled bookings, sum room totals
             foreach (var room in rooms)
             {
-                hotelGrossTotal += room["gross"] != null ? room["gross"].Value<decimal>() : 0;
-                hotelNetTotal += room["net"] != null ? room["net"].Value<decimal>() : 0;
+                hotelGrossTotal += room["gross"] != null && room["gross"].Type != JTokenType.Null ? room["gross"].Value<decimal>() : 0;
+                hotelNetTotal += room["net"] != null && room["net"].Type != JTokenType.Null ? room["net"].Value<decimal>() : 0;
                 if (board != "") {
                     room["board"] = board;
                 }
@@ -527,13 +563,13 @@ class Program
     private static bool ValidateAndDetermineMigration(JObject oldBooking, JObject newBooking)
     {
         // Validate that calculated totals match original totals
-        var originalGrossTotal = oldBooking["grossTotal"] != null ? oldBooking["grossTotal"].Value<decimal>() : 0;
-        var originalNetTotal = oldBooking["netTotal"] != null ? oldBooking["netTotal"].Value<decimal>() : 0;
-        var originalClientTotal = oldBooking["clientTotal"] != null ? oldBooking["clientTotal"].Value<decimal>() : 0;
+        var originalGrossTotal = oldBooking["grossTotal"] != null && oldBooking["grossTotal"].Type != JTokenType.Null ? oldBooking["grossTotal"].Value<decimal>() : 0;
+        var originalNetTotal = oldBooking["netTotal"] != null && oldBooking["netTotal"].Type != JTokenType.Null ? oldBooking["netTotal"].Value<decimal>() : 0;
+        var originalClientTotal = oldBooking["clientTotal"] != null && oldBooking["clientTotal"].Type != JTokenType.Null ? oldBooking["clientTotal"].Value<decimal>() : 0;
         
-        var calculatedGrossTotal = newBooking["grossTotal"] != null ? newBooking["grossTotal"].Value<decimal>() : 0;
-        var calculatedNetTotal = newBooking["netTotal"] != null ? newBooking["netTotal"].Value<decimal>() : 0;
-        var calculatedClientTotal = newBooking["clientTotal"] != null ? newBooking["clientTotal"].Value<decimal>() : 0;
+        var calculatedGrossTotal = newBooking["grossTotal"] != null && newBooking["grossTotal"].Type != JTokenType.Null ? newBooking["grossTotal"].Value<decimal>() : 0;
+        var calculatedNetTotal = newBooking["netTotal"] != null && newBooking["netTotal"].Type != JTokenType.Null ? newBooking["netTotal"].Value<decimal>() : 0;
+        var calculatedClientTotal = newBooking["clientTotal"] != null && newBooking["clientTotal"].Type != JTokenType.Null ? newBooking["clientTotal"].Value<decimal>() : 0;
         
         // Check if totals match (with small tolerance for rounding differences)
         const decimal tolerance = 0.01m;
