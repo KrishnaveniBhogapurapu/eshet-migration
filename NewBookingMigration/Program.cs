@@ -162,6 +162,9 @@ class Program
     private static async Task<(List<string> insertBookings, List<string> updateBookings)> GetBookingIdsToMigrate(ICluster cluster)
     {
         Console.WriteLine("Getting booking IDs that need migration...");
+        // Get bookings with null values that need updating
+        var bookingsWithNullValues = await GetBookingsWithNullValues(cluster);
+        Console.WriteLine($"Found {bookingsWithNullValues.Count} bookings with null fields that need updating");
         
         // Get all booking IDs from new collection with their updateTime
         var newQuery = $"SELECT id, updateTime FROM `{BUCKET_NAME}`.`{SCOPE}`.`{NEW_COLLECTION}`";
@@ -226,12 +229,41 @@ class Program
                         Console.WriteLine($"📝 Booking {bookingId} needs update (old: {oldUpdateTime:yyyy-MM-dd HH:mm:ss}, new: {newUpdateTime:yyyy-MM-dd HH:mm:ss})");
                         updateBookings.Add(bookingId);
                     }
+                    else if (bookingsWithNullValues.Contains(bookingId))
+                    {
+                        Console.WriteLine($"📝 Booking {bookingId} needs update (null values)");
+                        updateBookings.Add(bookingId);
+                    }
                 }
             }
         }
         
         Console.WriteLine($"Found {insertBookings.Count} bookings to INSERT and {updateBookings.Count} bookings to UPDATE");
         return (insertBookings, updateBookings);
+    }
+
+    private static async Task<List<string>> GetBookingsWithNullValues(ICluster cluster)
+    {
+        Console.WriteLine("Getting bookings with null periodEntitledDays or cancelledTime...");
+        
+        var nullFieldsQuery = $@"
+            SELECT id FROM `{BUCKET_NAME}`.`{SCOPE}`.`{NEW_COLLECTION}`
+            WHERE periodEntitledDays IS NULL
+            OR ANY p IN products SATISFIES p.status = 2 AND p.cancellationDetails IS NOT NULL 
+            AND (p.cancellationDetails.cancelledTime IS NULL) END";
+        
+        var bookingsWithNullValues = new List<string>();
+        var nullFieldsResult = await cluster.QueryAsync<JObject>(nullFieldsQuery);
+        
+        await foreach (var row in nullFieldsResult)
+        {
+            if (row != null && row["id"] != null)
+            {
+                bookingsWithNullValues.Add(row["id"].ToString());
+            }
+        }
+        
+        return bookingsWithNullValues;
     }
 
     private static async Task<(int successCount, int errorCount, int skippedCount)> ProcessBookingsByIds(ICluster cluster, IBucket bucket, List<string> bookingIds, string operationType)
@@ -457,7 +489,7 @@ class Program
             {
                 ["cancellationFeeNet"] = oldBooking["cancellationFeeNet"] ?? 0,
                 ["cancellationFeeGross"] = oldBooking["cancellationFeeGross"] ?? 0,
-                ["cancelledTime"] = oldBooking["cancelledTime"],
+                ["cancelledTime"] = oldBooking["cancelledTime"] ?? DateTime.Now,
                 ["cancellationReason"] = oldBooking["cancellationReason"] ?? ""
             } : null,
             ["netAdjustment"] = oldBooking["netAdjustment"] ?? 0,
@@ -607,7 +639,7 @@ class Program
             ["salaryPayments"] = oldBooking["salaryPayments"],
             ["specialRequests"] = oldBooking["specialRequests"] ?? new JArray(),
             ["bookingTags"] = oldBooking["bookingTags"],
-            ["periodEntitledDays"] = oldBooking["periodEntitledDays"],
+            ["periodEntitledDays"] = oldBooking["periodEntitledDays"] ?? 0,
         };
     }
 
