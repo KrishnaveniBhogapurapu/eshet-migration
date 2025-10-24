@@ -64,6 +64,9 @@ class Program
             Console.WriteLine($"❌ Errors: {updateResults.errorCount}");
             Console.WriteLine($"⚠️  Skipped (totals mismatch): {updateResults.skippedCount}");
             
+            // Update ID counter to prevent ID conflicts for new bookings
+            await UpdateIdCounter(cluster, bucket);
+            
             // Cleanup
             await cluster.DisposeAsync();
         }
@@ -877,5 +880,64 @@ class Program
             throw new InvalidOperationException("Logging directory not initialized. Call InitializeLoggingDirectory() first.");
         }
         return Path.Combine(_currentRunLogsDirectory, fileName);
+    }
+
+    private static async Task UpdateIdCounter(ICluster cluster, IBucket bucket)
+    {
+        try
+        {
+            Console.WriteLine($"\n🔢 Updating ID counter for {NEW_COLLECTION}...");
+            
+            // Query to get the maximum booking ID from the new collection
+            var maxIdQuery = $"SELECT MAX(id) as maxId FROM `{BUCKET_NAME}`.`{SCOPE}`.`{NEW_COLLECTION}`";
+            var maxIdResult = await cluster.QueryAsync<JObject>(maxIdQuery);
+            
+            uint maxId = 0;
+            await foreach (var row in maxIdResult)
+            {
+                if (row != null && row["maxId"] != null && row["maxId"].Type != JTokenType.Null)
+                {
+                    maxId = row["maxId"].Value<uint>();
+                }
+            }
+            
+            Console.WriteLine($"📊 Highest booking ID in collection: {maxId}");
+            
+            // Get current counter value from the new collection
+            var scopeObj = await bucket.ScopeAsync(SCOPE);
+            var collection = await scopeObj.CollectionAsync(NEW_COLLECTION);
+            
+            // Try to get the current counter document
+            var counterKey = "Counter";
+            
+            uint currentCounter = 0;
+            try
+            {
+                var counterResult = await collection.GetAsync(counterKey);
+                currentCounter = counterResult.ContentAs<uint>();
+                Console.WriteLine($"📊 Current counter value: {currentCounter}");
+            }
+            catch
+            {
+                Console.WriteLine("📊 No existing counter found, will create new one.");
+            }
+            
+            // Update counter to be equal to the max booking ID
+            var newCounterValue = Math.Max(currentCounter, maxId);
+            
+            if (newCounterValue > currentCounter)
+            {
+                await collection.UpsertAsync(counterKey, newCounterValue);
+                Console.WriteLine($"✅ Updated ID counter from {currentCounter} to {newCounterValue}");
+            }
+            else
+            {
+                Console.WriteLine($"✅ ID counter is already up to date (current: {currentCounter}, max booking ID: {maxId})");
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"⚠️  Failed to update ID counter: {ex.Message}");
+        }
     }
 }
