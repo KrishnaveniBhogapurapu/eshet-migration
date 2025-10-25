@@ -162,12 +162,98 @@ class Program
         return bookings;
     }
 
+    private static async Task<Dictionary<string, string>> FetchHotelNames(ICluster cluster, List<string> atlantisHotelIds)
+    {
+        var hotelNames = new Dictionary<string, string>();
+        
+        if (atlantisHotelIds.Count == 0)
+        {
+            return hotelNames;
+        }
+
+        Console.WriteLine($"Fetching hotel names for {atlantisHotelIds.Count} hotels...");
+        
+        try
+        {
+            // Convert string hotel IDs to uint for the query
+            var numericHotelIds = atlantisHotelIds
+                .Where(id => uint.TryParse(id, out _))
+                .Select(id => uint.Parse(id))
+                .ToList();
+            
+            if (numericHotelIds.Count == 0)
+            {
+                Console.WriteLine("No valid numeric hotel IDs found.");
+                return hotelNames;
+            }
+            
+            // Query Atlantis Hotels collection to get hotel names
+            var hotelQuery = $"SELECT id, name FROM `{BUCKET_NAME}`.`{SCOPE}`.`Hotels` WHERE id IN $hotelIds";
+            var result = await cluster.QueryAsync<JObject>(hotelQuery, options => options.Parameter("hotelIds", numericHotelIds));
+            
+            await foreach (var row in result)
+            {
+                if (row != null && row["id"] != null && row["name"] != null)
+                {
+                    var hotelId = row["id"].ToString();
+                    var hotelName = row["name"].ToString();
+                    hotelNames[hotelId] = hotelName;
+                }
+            }
+            
+            Console.WriteLine($"Successfully fetched {hotelNames.Count} hotel names");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"⚠️  Failed to fetch hotel names: {ex.Message}");
+        }
+        
+        return hotelNames;
+    }
+
+    private static async Task<List<string>> FindBookingsWithGenericHotelNames(ICluster cluster)
+    {
+        var bookingIds = new List<string>();
+        
+        try
+        {
+            Console.WriteLine("🔍 Finding bookings with generic 'Hotel Booking' product names...");
+            
+            // Query to find bookings that have products with name "Hotel Booking"
+            var query = $@"
+                SELECT id FROM `{BUCKET_NAME}`.`{SCOPE}`.`{NEW_COLLECTION}`
+                WHERE ANY p IN products SATISFIES p.name = 'Hotel Booking' END";
+            
+            var result = await cluster.QueryAsync<JObject>(query);
+            
+            await foreach (var row in result)
+            {
+                if (row != null && row["id"] != null)
+                {
+                    bookingIds.Add(row["id"].ToString());
+                }
+            }
+            
+            Console.WriteLine($"📊 Found {bookingIds.Count} bookings with generic hotel product names");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"⚠️  Failed to find bookings with generic hotel names: {ex.Message}");
+        }
+        
+        return bookingIds;
+    }
+
     private static async Task<(List<string> insertBookings, List<string> updateBookings)> GetBookingIdsToMigrate(ICluster cluster)
     {
         Console.WriteLine("Getting booking IDs that need migration...");
         // Get bookings with null values that need updating
         var bookingsWithNullValues = await GetBookingsWithNullValues(cluster);
         Console.WriteLine($"Found {bookingsWithNullValues.Count} bookings with null fields that need updating");
+        
+        // Get bookings with generic hotel names that need updating
+        var bookingsWithGenericNames = await FindBookingsWithGenericHotelNames(cluster);
+        Console.WriteLine($"Found {bookingsWithGenericNames.Count} bookings with generic hotel names that need updating");
         
         // Get all booking IDs from new collection with their updateTime
         var newQuery = $"SELECT id, updateTime FROM `{BUCKET_NAME}`.`{SCOPE}`.`{NEW_COLLECTION}`";
@@ -237,6 +323,11 @@ class Program
                         Console.WriteLine($"📝 Booking {bookingId} needs update (null values)");
                         updateBookings.Add(bookingId);
                     }
+                    else if (bookingsWithGenericNames.Contains(bookingId))
+                    {
+                        Console.WriteLine($"📝 Booking {bookingId} needs update (generic hotel name)");
+                        updateBookings.Add(bookingId);
+                    }
                 }
             }
         }
@@ -293,6 +384,16 @@ class Program
             // Fetch all bookings in this batch
             var batchBookings = await FetchBookingsBatch(cluster, batchIds);
             
+            // Extract unique atlantisHotelIds from the batch
+            var atlantisHotelIds = batchBookings.Values
+                .Where(booking => booking["atlantisHotelId"] != null)
+                .Select(booking => booking["atlantisHotelId"].ToString())
+                .Distinct()
+                .ToList();
+            
+            // Fetch hotel names for this batch
+            var hotelNames = await FetchHotelNames(cluster, atlantisHotelIds);
+            
             // Process each booking in the batch
             for (int i = 0; i < batchIds.Count; i++)
             {
@@ -317,7 +418,7 @@ class Program
 
                     // Process single booking
                     var isUpdate = operationType == "UPDATE";
-                    var result = await ProcessSingleBooking(bucket, booking, isUpdate);
+                    var result = await ProcessSingleBooking(bucket, booking, hotelNames, isUpdate);
                     
                     // Update totals
                     if (result == "success")
@@ -347,7 +448,7 @@ class Program
     }
 
 
-    private static async Task<string> ProcessSingleBooking(IBucket bucket, JObject oldBooking, bool isUpdate = false)
+    private static async Task<string> ProcessSingleBooking(IBucket bucket, JObject oldBooking, Dictionary<string, string> hotelNames, bool isUpdate = false)
     {
         var operation = isUpdate ? "updating" : "migrating";
         try
@@ -356,7 +457,7 @@ class Program
             Console.WriteLine($"Processing booking ID: {bookingId} ({operation})");
             
             // Convert to new booking format and validate totals
-            var (newBooking, shouldInsert) = ConvertToNewBooking(oldBooking);
+            var (newBooking, shouldInsert) = ConvertToNewBooking(oldBooking, hotelNames);
             
             if (!shouldInsert)
             {
@@ -399,13 +500,13 @@ class Program
     }
 
 
-    private static (JObject newBooking, bool shouldInsert) ConvertToNewBooking(JObject oldBooking)
+    private static (JObject newBooking, bool shouldInsert) ConvertToNewBooking(JObject oldBooking, Dictionary<string, string> hotelNames)
     {
         // Create products array
         var products = new JArray();
 
         // Create hotel product
-        var hotelProduct = CreateHotelProduct(oldBooking);
+        var hotelProduct = CreateHotelProduct(oldBooking, hotelNames);
         products.Add(hotelProduct);
 
         // Create interest product (if interest exists)
@@ -436,7 +537,7 @@ class Program
         return (newBooking, shouldInsert);
     }
 
-    private static JObject CreateHotelProduct(JObject oldBooking)
+    private static JObject CreateHotelProduct(JObject oldBooking, Dictionary<string, string> hotelNames)
     {
         var board = oldBooking["board"]?.Value<string>() ?? "";
         var clientComment = oldBooking["clientComment"]?.Value<string>() ?? "";
@@ -475,9 +576,17 @@ class Program
             hotelNetTotal = Math.Round(hotelNetTotal, 2);
         }
 
+        // Get hotel name from Atlantis system
+        var atlantisHotelId = oldBooking["atlantisHotelId"]?.ToString();
+        var hotelName = "Hotel Booking"; // Default name
+        if (!string.IsNullOrEmpty(atlantisHotelId) && hotelNames.Count > 0 && hotelNames.ContainsKey(atlantisHotelId))
+        {
+            hotelName = hotelNames[atlantisHotelId];
+        }
+
         return new JObject
         {
-            ["name"] = "Hotel Booking",
+            ["name"] = hotelName,
             ["status"] = oldBooking["status"],
             ["productDetails"] = new JObject
             {
