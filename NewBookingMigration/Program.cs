@@ -343,6 +343,7 @@ class Program
         var nullFieldsQuery = $@"
             SELECT id FROM `{BUCKET_NAME}`.`{SCOPE}`.`{NEW_COLLECTION}`
             WHERE periodEntitledDays IS NULL
+            OR ccPayments IS NULL
             OR ANY p IN products SATISFIES p.status = 2 AND p.cancellationDetails IS NOT NULL 
             AND (p.cancellationDetails.cancelledTime IS NULL) END";
         
@@ -747,7 +748,7 @@ class Program
             ["period"] = oldBooking["period"],
             ["category"] = oldBooking["category"],
             ["tmura"] = oldBooking["tmura"],
-            ["ccPayments"] = oldBooking["ccPayments"],
+            ["ccPayments"] = oldBooking["ccPayments"] ?? 0,
             ["salaryPayments"] = oldBooking["salaryPayments"],
             ["specialRequests"] = oldBooking["specialRequests"] ?? new JArray(),
             ["bookingTags"] = oldBooking["bookingTags"],
