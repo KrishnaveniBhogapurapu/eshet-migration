@@ -20,6 +20,8 @@ internal class BookingUpdateMigration
         try
         {
             Console.WriteLine("Starting Booking model update migration process...");
+            Console.WriteLine($"📦 Source Collection: {_config.SourceCollection}");
+            Console.WriteLine($"📦 Target Collection: {_config.TargetCollection}");
             
             // Initialize Couchbase connection
             var cluster = await InitializeCouchbaseConnection();
@@ -27,7 +29,6 @@ internal class BookingUpdateMigration
             
             // Get all booking IDs
             var bookingIds = await GetAllBookingIds(cluster);
-            Console.WriteLine($"📊 Found {bookingIds.Count} bookings to update");
             
             if (bookingIds.Count == 0)
             {
@@ -36,7 +37,7 @@ internal class BookingUpdateMigration
                 return;
             }
             
-            // Process updates in batches
+            // Process migration in batches
             var results = await ProcessBookings(cluster, bucket, bookingIds);
             
             // Display final results
@@ -83,9 +84,29 @@ internal class BookingUpdateMigration
         
         try
         {
-            // Only fetch bookings that don't have users array (not yet migrated)
-            var query = $"SELECT id FROM `{_config.BucketName}`.`{_config.Scope}`.`{_config.TargetCollection}` WHERE users IS MISSING";
-            var result = await cluster.QueryAsync<JObject>(query);
+            var targetIds = new List<uint>();
+            var targetQuery = $"SELECT id FROM `{_config.BucketName}`.`{_config.Scope}`.`{_config.TargetCollection}`";
+            var targetResult = await cluster.QueryAsync<JObject>(targetQuery);
+            
+            await foreach (var row in targetResult)
+            {
+                if (row != null && row["id"] != null)
+                {
+                    var id = row["id"].Value<uint>();
+                    targetIds.Add(id);
+                }
+            }
+
+            Console.WriteLine($"Found {targetIds.Count} bookings in {_config.TargetCollection}");
+
+            var sourceQuery = $"SELECT id FROM `{_config.BucketName}`.`{_config.Scope}`.`{_config.SourceCollection}`";
+
+            if (targetIds.Count > 0)
+            {
+                var idsString = string.Join(",", targetIds);
+                sourceQuery = sourceQuery + $" WHERE id NOT IN [{idsString}]";
+            }
+            var result = await cluster.QueryAsync<JObject>(sourceQuery);
             
             await foreach (var row in result)
             {
@@ -95,6 +116,8 @@ internal class BookingUpdateMigration
                     bookingIds.Add(id);
                 }
             }
+            
+            Console.WriteLine($"Found {bookingIds.Count} bookings in source that are not present in target");            
         }
         catch (Exception ex)
         {
@@ -183,7 +206,7 @@ internal class BookingUpdateMigration
         
         // Build query with numeric IDs
         var idsString = string.Join(",", bookingIds);
-        var query = $"SELECT {_config.TargetCollection}.* FROM `{_config.BucketName}`.`{_config.Scope}`.`{_config.TargetCollection}` WHERE id IN [{idsString}]";
+        var query = $"SELECT {_config.SourceCollection}.* FROM `{_config.BucketName}`.`{_config.Scope}`.`{_config.SourceCollection}` WHERE id IN [{idsString}]";
         
         var result = await cluster.QueryAsync<JObject>(query);
         

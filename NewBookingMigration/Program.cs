@@ -88,7 +88,7 @@ class Program
         try
         {
             // Create migration configuration (source and target are the same collection)
-            var config = CreateMigrationConfig(TARGET_COLLECTION, TARGET_COLLECTION);
+            var config = CreateMigrationConfig("Bookings1", TARGET_COLLECTION);
             
             // Create migration instance
             var migration = new BookingUpdateMigration(config);
