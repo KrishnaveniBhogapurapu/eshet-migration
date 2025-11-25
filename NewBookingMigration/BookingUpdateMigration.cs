@@ -84,40 +84,86 @@ internal class BookingUpdateMigration
         
         try
         {
-            var targetIds = new List<uint>();
-            var targetQuery = $"SELECT id FROM `{_config.BucketName}`.`{_config.Scope}`.`{_config.TargetCollection}`";
+            // Get all bookings from target collection with their updateTime
+            var targetQuery = $"SELECT id, updateTime FROM `{_config.BucketName}`.`{_config.Scope}`.`{_config.TargetCollection}`";
+            var migratedBookings = new Dictionary<uint, DateTime>();
             var targetResult = await cluster.QueryAsync<JObject>(targetQuery);
             
             await foreach (var row in targetResult)
             {
                 if (row != null && row["id"] != null)
                 {
-                    var id = row["id"].Value<uint>();
-                    targetIds.Add(id);
+                    var idToken = row["id"];
+                    if (idToken != null)
+                    {
+                        var id = idToken.Value<uint>();
+                        DateTime updateTime = DateTime.MinValue;
+                        
+                        var updateTimeToken = row["updateTime"];
+                        if (updateTimeToken != null && updateTimeToken.Type != JTokenType.Null)
+                        {
+                            if (DateTime.TryParse(updateTimeToken.ToString(), out var parsedTime))
+                            {
+                                updateTime = parsedTime;
+                            }
+                        }
+                        
+                        migratedBookings[id] = updateTime;
+                    }
                 }
             }
 
-            Console.WriteLine($"Found {targetIds.Count} bookings in {_config.TargetCollection}");
+            Console.WriteLine($"Found {migratedBookings.Count} migrated bookings in {_config.TargetCollection}");
 
-            var sourceQuery = $"SELECT id FROM `{_config.BucketName}`.`{_config.Scope}`.`{_config.SourceCollection}`";
-
-            if (targetIds.Count > 0)
-            {
-                var idsString = string.Join(",", targetIds);
-                sourceQuery = sourceQuery + $" WHERE id NOT IN [{idsString}]";
-            }
-            var result = await cluster.QueryAsync<JObject>(sourceQuery);
+            // Get all bookings from source collection with their updateTime
+            var sourceQuery = $"SELECT id, updateTime FROM `{_config.BucketName}`.`{_config.Scope}`.`{_config.SourceCollection}`";
+            var sourceResult = await cluster.QueryAsync<JObject>(sourceQuery);
             
-            await foreach (var row in result)
+            int newBookingsCount = 0;
+            int updatedBookingsCount = 0;
+            
+            await foreach (var row in sourceResult)
             {
                 if (row != null && row["id"] != null)
                 {
-                    var id = row["id"].Value<uint>();
-                    bookingIds.Add(id);
+                    var idToken = row["id"];
+                    if (idToken != null)
+                    {
+                        var bookingId = idToken.Value<uint>();
+                        
+                        if (!migratedBookings.ContainsKey(bookingId))
+                        {
+                            // New booking - needs insertion
+                            bookingIds.Add(bookingId);
+                            newBookingsCount++;
+                        }
+                        else
+                        {
+                            // Existing booking - check if source version is newer
+                            DateTime sourceUpdateTime = DateTime.MinValue;
+                            
+                            var updateTimeToken = row["updateTime"];
+                            if (updateTimeToken != null && updateTimeToken.Type != JTokenType.Null)
+                            {
+                                if (DateTime.TryParse(updateTimeToken.ToString(), out var parsedTime))
+                                {
+                                    sourceUpdateTime = parsedTime;
+                                }
+                            }
+                            
+                            var targetUpdateTime = migratedBookings[bookingId];
+                            if (sourceUpdateTime > targetUpdateTime)
+                            {
+                                Console.WriteLine($"📝 Booking {bookingId} needs update (source: {sourceUpdateTime:yyyy-MM-dd HH:mm:ss}, target: {targetUpdateTime:yyyy-MM-dd HH:mm:ss})");
+                                bookingIds.Add(bookingId);
+                                updatedBookingsCount++;
+                            }
+                        }
+                    }
                 }
             }
             
-            Console.WriteLine($"Found {bookingIds.Count} bookings in source that are not present in target");            
+            Console.WriteLine($"Found {newBookingsCount} new bookings and {updatedBookingsCount} updated bookings to process (total: {bookingIds.Count})");            
         }
         catch (Exception ex)
         {
@@ -233,7 +279,16 @@ internal class BookingUpdateMigration
         // If no ownerKey, skip (shouldn't happen since we filter in query, but safety check)
         if (string.IsNullOrEmpty(ownerKey))
         {
-            Console.WriteLine($"  ⚠️  Booking has no ownerKey, skipping");
+            Console.WriteLine($" ** Booking has no ownerKey");
+            if (booking["tmura"] != null && booking["tmura"] is JObject tmura)
+            {
+                Console.WriteLine($" ** Migrating from tmura");
+                tmura["selfPaymentTotal"] = booking["clientPrice"]?["extras"]?.Sum(extra => extra?["extra"]?.Value<decimal>() ?? 0m) ?? 0m;
+            }
+            else
+            {
+                Console.WriteLine($" ** Booking has no tmura");
+            }
             EnsureNewFieldsExist(booking);
             return (booking, false);
         }
@@ -242,6 +297,11 @@ internal class BookingUpdateMigration
         var specialRequests = booking["specialRequests"] as JArray ?? new JArray();
         var requests = booking["requests"] as JArray ?? new JArray();
         var allRequests = new JArray(requests.Concat(specialRequests));
+        var requestSections = new JObject();
+        if (allRequests.Count > 0)
+        {
+            requestSections["requests"] = allRequests;
+        }
         
         Console.WriteLine($"  🔄 Migrating from old model structure...");
         Console.WriteLine($"     OwnerKey: {ownerKey}");
@@ -255,9 +315,7 @@ internal class BookingUpdateMigration
             ["basePrice"] = 0,
             ["paymentType"] = 0, // PaymentType.Salary
             ["clientTotal"] = 0,
-            ["specialRequests"] = allRequests,
-            ["requests"] = allRequests,
-            ["requestSections"] = new JObject(),
+            ["requestSections"] = requestSections,
             ["clientPrice"] = clientPrice ?? CreateDefaultClientPrice()
         };
         

@@ -9,14 +9,9 @@ namespace NewBookingMigration;
 internal class GroupBillingBookingMigration
 {
     private readonly MigrationConfig _config;
-    
-    private static Dictionary<string, uint> _idMapping = new(); // Old GBB ID -> New Booking ID
 
-    private const string ID_MAPPING_FILE_NAME = "gbb_to_booking_id_mapping.json";
     private const string ERROR_BOOKINGS_FILE_NAME = "error_gbb_migration_report.txt";
-    private const string MAX_ID = "maxId";
     private const string TOTAL = "total";
-    private const string MIGRATION_USER = "migration";
 
     public GroupBillingBookingMigration(MigrationConfig config)
     {
@@ -33,10 +28,6 @@ internal class GroupBillingBookingMigration
             var cluster = await InitializeCouchbaseConnection();
             var bucket = await GetBucket(cluster);
             
-            // Get current booking counter
-            var currentCounter = await GetBookingCounter(cluster, bucket);
-            Console.WriteLine($"📊 Current Booking counter: {currentCounter}");
-            
             // Get all Group Billing Bookings
             var gbbIds = await GetAllGroupBillingBookingIds(cluster);
             Console.WriteLine($"📊 Found {gbbIds.Count} Group Billing Bookings to migrate");
@@ -49,19 +40,12 @@ internal class GroupBillingBookingMigration
             }
             
             // Process migrations in batches
-            var results = await ProcessGroupBillingBookings(cluster, bucket, gbbIds, currentCounter);
-            
-            // Save ID mapping to file
-            await SaveIdMapping();
+            var results = await ProcessGroupBillingBookings(cluster, bucket, gbbIds);
             
             // Display final results
             Console.WriteLine($"\n✅ Migration completed!");
             Console.WriteLine($"✅ Successfully migrated: {results.successCount}");
             Console.WriteLine($"❌ Errors: {results.errorCount}");
-            Console.WriteLine($"📝 ID Mapping saved to: {GetLogFilePath(ID_MAPPING_FILE_NAME)}");
-            
-            // Update booking counter
-            await UpdateBookingCounter(cluster, bucket);
             
             // Cleanup
             await cluster.DisposeAsync();
@@ -96,58 +80,92 @@ internal class GroupBillingBookingMigration
         return bucket;
     }
 
-    private async Task<uint> GetBookingCounter(ICluster cluster, IBucket bucket)
-    {
-        try
-        {
-            var scopeObj = await bucket.ScopeAsync(_config.Scope);
-            var collection = await scopeObj.CollectionAsync(_config.TargetCollection);
-            var counterKey = "Counter";
-            
-            try
-            {
-                var counterResult = await collection.GetAsync(counterKey);
-                return counterResult.ContentAs<uint>();
-            }
-            catch
-            {
-                // If counter doesn't exist, get max ID from bookings
-                var maxIdQuery = $"SELECT MAX(id) as {MAX_ID} FROM `{_config.BucketName}`.`{_config.Scope}`.`{_config.TargetCollection}`";
-                var maxIdResult = await cluster.QueryAsync<JObject>(maxIdQuery);
-                
-                uint maxId = 0;
-                await foreach (var row in maxIdResult)
-                {
-                    if (row != null && row[MAX_ID] != null && row[MAX_ID].Type != JTokenType.Null)
-                    {
-                        maxId = row[MAX_ID].Value<uint>();
-                    }
-                }
-                
-                return maxId;
-            }
-        }
-        catch (Exception ex)
-        {
-            Console.WriteLine($"⚠️  Failed to get booking counter: {ex.Message}");
-            return 0;
-        }
-    }
-
     private async Task<List<string>> GetAllGroupBillingBookingIds(ICluster cluster)
     {
         var gbbIds = new List<string>();
         
         try
         {
-            var query = $"SELECT id FROM `{_config.BucketName}`.`{_config.Scope}`.`{_config.SourceCollection}`";
-            var result = await cluster.QueryAsync<JObject>(query);
+            // Get all bookings from target collection with their updateTime (those with billing products)
+            var targetQuery = $@"
+                SELECT id, updateTime 
+                FROM `{_config.BucketName}`.`{_config.Scope}`.`{_config.TargetCollection}`
+                WHERE ANY p IN products SATISFIES p.productDetails.type = 3 END";
+            var migratedBookings = new Dictionary<string, DateTime>(); // GBB ID (as string) -> updateTime
+            var targetResult = await cluster.QueryAsync<JObject>(targetQuery);
             
-            await foreach (var row in result)
+            await foreach (var row in targetResult)
             {
                 if (row != null && row["id"] != null)
                 {
-                    gbbIds.Add(row["id"].ToString());
+                    var idToken = row["id"];
+                    if (idToken != null)
+                    {
+                        // Booking ID in target is uint, but we'll use it as string to match with GBB ID
+                        var bookingId = idToken.ToString();
+                        DateTime updateTime = DateTime.MinValue;
+                        
+                        var updateTimeToken = row["updateTime"];
+                        if (updateTimeToken != null && updateTimeToken.Type != JTokenType.Null)
+                        {
+                            if (DateTime.TryParse(updateTimeToken.ToString(), out var parsedTime))
+                            {
+                                updateTime = parsedTime;
+                            }
+                        }
+                        
+                        migratedBookings[bookingId] = updateTime;
+                    }
+                }
+            }
+
+            Console.WriteLine($"Found {migratedBookings.Count} migrated Group Billing Bookings in {_config.TargetCollection}");
+
+            // Get all Group Billing Bookings from source collection with their updateTime
+            var sourceQuery = $"SELECT id, updateTime FROM `{_config.BucketName}`.`{_config.Scope}`.`{_config.SourceCollection}`";
+            var sourceResult = await cluster.QueryAsync<JObject>(sourceQuery);
+            
+            int newGBBsCount = 0;
+            int updatedGBBsCount = 0;
+            
+            await foreach (var row in sourceResult)
+            {
+                if (row != null && row["id"] != null)
+                {
+                    var idToken = row["id"];
+                    if (idToken != null)
+                    {
+                        var gbbId = idToken.ToString();
+                        
+                        if (!migratedBookings.ContainsKey(gbbId))
+                        {
+                            // New GBB - needs migration
+                            gbbIds.Add(gbbId);
+                            newGBBsCount++;
+                        }
+                        else
+                        {
+                            // Existing GBB - check if source version is newer
+                            DateTime sourceUpdateTime = DateTime.MinValue;
+                            
+                            var updateTimeToken = row["updateTime"];
+                            if (updateTimeToken != null && updateTimeToken.Type != JTokenType.Null)
+                            {
+                                if (DateTime.TryParse(updateTimeToken.ToString(), out var parsedTime))
+                                {
+                                    sourceUpdateTime = parsedTime;
+                                }
+                            }
+                            
+                            var targetUpdateTime = migratedBookings[gbbId];
+                            if (sourceUpdateTime > targetUpdateTime)
+                            {
+                                Console.WriteLine($"📝 Group Billing Booking {gbbId} needs update (source: {sourceUpdateTime:yyyy-MM-dd HH:mm:ss}, target: {targetUpdateTime:yyyy-MM-dd HH:mm:ss})");
+                                gbbIds.Add(gbbId);
+                                updatedGBBsCount++;
+                            }
+                        }
+                    }
                 }
             }
             
@@ -162,6 +180,8 @@ internal class GroupBillingBookingMigration
                 // Fall back to string comparison
                 return string.Compare(a, b, StringComparison.Ordinal);
             });
+            
+            Console.WriteLine($"Found {newGBBsCount} new Group Billing Bookings and {updatedGBBsCount} updated Group Billing Bookings to process (total: {gbbIds.Count})");
         }
         catch (Exception ex)
         {
@@ -172,11 +192,10 @@ internal class GroupBillingBookingMigration
     }
 
     private async Task<(int successCount, int errorCount)> ProcessGroupBillingBookings(
-        ICluster cluster, IBucket bucket, List<string> gbbIds, uint startCounter)
+        ICluster cluster, IBucket bucket, List<string> gbbIds)
     {
         int successCount = 0;
         int errorCount = 0;
-        uint currentCounter = startCounter;
 
         Console.WriteLine($"Processing {gbbIds.Count} Group Billing Bookings in batches of {_config.BatchSize}...");
 
@@ -209,23 +228,24 @@ internal class GroupBillingBookingMigration
                         continue;
                     }
 
-                    // Assign new booking ID (increment from current counter)
-                    currentCounter++;
-                    uint newBookingId = currentCounter;
+                    // Parse GBB ID to uint for booking ID (use same ID)
+                    if (!uint.TryParse(gbbId, out uint bookingId))
+                    {
+                        LogError(gbbId, new Exception($"GroupBillingBooking ID '{gbbId}' cannot be parsed as uint"));
+                        errorCount++;
+                        continue;
+                    }
                     
-                    Console.WriteLine($"🔄 Migrating GBB ID: {gbbId} -> Booking ID: {newBookingId}");
+                    Console.WriteLine($"🔄 Migrating GBB ID: {gbbId} -> Booking ID: {bookingId}");
                     
                     // Convert GBB to Booking format
-                    var booking = ConvertGroupBillingBookingToBooking(gbb, newBookingId);
+                    var booking = ConvertGroupBillingBookingToBooking(gbb, bookingId);
                     
-                    // Insert into Bookings collection
-                    await InsertBooking(bucket, newBookingId, booking);
-                    
-                    // Store mapping
-                    _idMapping[gbbId] = newBookingId;
+                    // Insert/Update into Bookings collection
+                    await InsertBooking(bucket, bookingId, booking);
                     
                     successCount++;
-                    Console.WriteLine($"✅ Successfully migrated GBB {gbbId} to Booking {newBookingId}");
+                    Console.WriteLine($"✅ Successfully migrated GBB {gbbId} to Booking {bookingId}");
                 }
                 catch (Exception ex)
                 {
@@ -290,7 +310,7 @@ internal class GroupBillingBookingMigration
         return sortedGbbs;
     }
 
-    private JObject ConvertGroupBillingBookingToBooking(JObject gbb, uint newBookingId)
+    private JObject ConvertGroupBillingBookingToBooking(JObject gbb, uint bookingId)
     {
         // Extract GBB fields
         var segmentId = gbb["segmentId"]?.Value<uint>() ?? 0;
@@ -331,7 +351,7 @@ internal class GroupBillingBookingMigration
         // Create new booking object matching Booking model structure
         var booking = new JObject
         {
-            ["id"] = newBookingId,
+            ["id"] = bookingId,
             ["status"] = 1, // OK status (assuming migrated GBBs are active)
             ["segmentId"] = segmentId,
             ["subSegmentId"] = subSegmentId,
@@ -402,80 +422,6 @@ internal class GroupBillingBookingMigration
         var scopeObj = await bucket.ScopeAsync(_config.Scope);
         var collection = await scopeObj.CollectionAsync(_config.TargetCollection);
         await collection.UpsertAsync(bookingId.ToString(), booking);
-    }
-
-    private async Task SaveIdMapping()
-    {
-        try
-        {
-            var fileName = GetLogFilePath(ID_MAPPING_FILE_NAME);
-            var mappingJson = Newtonsoft.Json.JsonConvert.SerializeObject(_idMapping, Newtonsoft.Json.Formatting.Indented);
-            await File.WriteAllTextAsync(fileName, mappingJson);
-            Console.WriteLine($"✅ ID mapping saved to: {fileName}");
-        }
-        catch (Exception ex)
-        {
-            Console.WriteLine($"⚠️  Failed to save ID mapping: {ex.Message}");
-        }
-    }
-
-    private async Task UpdateBookingCounter(ICluster cluster, IBucket bucket)
-    {
-        try
-        {
-            Console.WriteLine($"\n🔢 Updating ID counter for {_config.TargetCollection}...");
-            
-            // Query to get the maximum booking ID from the target collection
-            var maxIdQuery = $"SELECT MAX(id) as {MAX_ID} FROM `{_config.BucketName}`.`{_config.Scope}`.`{_config.TargetCollection}`";
-            var maxIdResult = await cluster.QueryAsync<JObject>(maxIdQuery);
-            
-            uint maxId = 0;
-            await foreach (var row in maxIdResult)
-            {
-                if (row != null && row[MAX_ID] != null && row[MAX_ID].Type != JTokenType.Null)
-                {
-                    maxId = row[MAX_ID].Value<uint>();
-                }
-            }
-            
-            Console.WriteLine($"📊 Highest booking ID in collection: {maxId}");
-            
-            // Get current counter value from the target collection
-            var scopeObj = await bucket.ScopeAsync(_config.Scope);
-            var collection = await scopeObj.CollectionAsync(_config.TargetCollection);
-            
-            // Try to get the current counter document
-            var counterKey = "Counter";
-            
-            uint currentCounter = 0;
-            try
-            {
-                var counterResult = await collection.GetAsync(counterKey);
-                currentCounter = counterResult.ContentAs<uint>();
-                Console.WriteLine($"📊 Current counter value: {currentCounter}");
-            }
-            catch
-            {
-                Console.WriteLine("📊 No existing counter found, will create new one.");
-            }
-            
-            // Update counter to be equal to the max booking ID
-            var newCounterValue = Math.Max(currentCounter, maxId);
-            
-            if (newCounterValue > currentCounter)
-            {
-                await collection.UpsertAsync(counterKey, newCounterValue);
-                Console.WriteLine($"✅ Updated ID counter from {currentCounter} to {newCounterValue}");
-            }
-            else
-            {
-                Console.WriteLine($"✅ ID counter is already up to date (current: {currentCounter}, max booking ID: {maxId})");
-            }
-        }
-        catch (Exception ex)
-        {
-            Console.WriteLine($"⚠️  Failed to update ID counter: {ex.Message}");
-        }
     }
 
     private void LogError(string gbbId, Exception ex)
