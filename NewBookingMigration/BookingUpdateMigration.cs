@@ -84,9 +84,10 @@ internal class BookingUpdateMigration
         
         try
         {
-            // Get all bookings from target collection with their updateTime
-            var targetQuery = $"SELECT id, updateTime FROM `{_config.BucketName}`.`{_config.Scope}`.`{_config.TargetCollection}`";
+            // Get all bookings from target collection with their updateTime and users field
+            var targetQuery = $"SELECT id, updateTime, users FROM `{_config.BucketName}`.`{_config.Scope}`.`{_config.TargetCollection}`";
             var migratedBookings = new Dictionary<uint, DateTime>();
+            var bookingsWithEmptyUsers = new HashSet<uint>();
             var targetResult = await cluster.QueryAsync<JObject>(targetQuery);
             
             await foreach (var row in targetResult)
@@ -109,11 +110,23 @@ internal class BookingUpdateMigration
                         }
                         
                         migratedBookings[id] = updateTime;
+                        
+                        // Check if users is null or empty
+                        var usersToken = row["users"];
+                        if (usersToken == null || usersToken.Type == JTokenType.Null)
+                        {
+                            bookingsWithEmptyUsers.Add(id);
+                        }
+                        else if (usersToken is JArray usersArray && usersArray.Count == 0)
+                        {
+                            bookingsWithEmptyUsers.Add(id);
+                        }
                     }
                 }
             }
 
             Console.WriteLine($"Found {migratedBookings.Count} migrated bookings in {_config.TargetCollection}");
+            Console.WriteLine($"Found {bookingsWithEmptyUsers.Count} bookings with empty or null users field");
 
             // Get all bookings from source collection with their updateTime
             var sourceQuery = $"SELECT id, updateTime FROM `{_config.BucketName}`.`{_config.Scope}`.`{_config.SourceCollection}`";
@@ -121,6 +134,7 @@ internal class BookingUpdateMigration
             
             int newBookingsCount = 0;
             int updatedBookingsCount = 0;
+            int emptyUsersCount = 0;
             
             await foreach (var row in sourceResult)
             {
@@ -163,7 +177,18 @@ internal class BookingUpdateMigration
                 }
             }
             
-            Console.WriteLine($"Found {newBookingsCount} new bookings and {updatedBookingsCount} updated bookings to process (total: {bookingIds.Count})");            
+            // Add bookings from target collection that have empty or null users
+            foreach (var bookingId in bookingsWithEmptyUsers)
+            {
+                if (!bookingIds.Contains(bookingId))
+                {
+                    Console.WriteLine($"📝 Booking {bookingId} needs update (empty or null users field)");
+                    bookingIds.Add(bookingId);
+                    emptyUsersCount++;
+                }
+            }
+            
+            Console.WriteLine($"Found {newBookingsCount} new bookings, {updatedBookingsCount} updated bookings, and {emptyUsersCount} bookings with empty/null users to process (total: {bookingIds.Count})");            
         }
         catch (Exception ex)
         {
@@ -315,6 +340,8 @@ internal class BookingUpdateMigration
             ["basePrice"] = 0,
             ["paymentType"] = 0, // PaymentType.Salary
             ["clientTotal"] = 0,
+            ["requests"] = allRequests,
+            ["specialRequests"] = allRequests,
             ["requestSections"] = requestSections,
             ["clientPrice"] = clientPrice ?? CreateDefaultClientPrice()
         };
