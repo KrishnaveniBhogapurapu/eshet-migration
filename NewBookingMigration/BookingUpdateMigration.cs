@@ -85,9 +85,10 @@ internal class BookingUpdateMigration
         try
         {
             // Get all bookings from target collection with their updateTime and users field
-            var targetQuery = $"SELECT id, updateTime, users FROM `{_config.BucketName}`.`{_config.Scope}`.`{_config.TargetCollection}`";
+            // var targetQuery = $"SELECT id, updateTime, users FROM `{_config.BucketName}`.`{_config.Scope}`.`{_config.TargetCollection}`";
+            var targetQuery = $"SELECT id, updateTime FROM `{_config.BucketName}`.`{_config.Scope}`.`{_config.TargetCollection}`";
             var migratedBookings = new Dictionary<uint, DateTime>();
-            var bookingsWithEmptyUsers = new HashSet<uint>();
+            // var bookingsWithEmptyUsers = new HashSet<uint>();
             var targetResult = await cluster.QueryAsync<JObject>(targetQuery);
             
             await foreach (var row in targetResult)
@@ -112,21 +113,21 @@ internal class BookingUpdateMigration
                         migratedBookings[id] = updateTime;
                         
                         // Check if users is null or empty
-                        var usersToken = row["users"];
-                        if (usersToken == null || usersToken.Type == JTokenType.Null)
-                        {
-                            bookingsWithEmptyUsers.Add(id);
-                        }
-                        else if (usersToken is JArray usersArray && usersArray.Count == 0)
-                        {
-                            bookingsWithEmptyUsers.Add(id);
-                        }
+                        // var usersToken = row["users"];
+                        // if (usersToken == null || usersToken.Type == JTokenType.Null)
+                        // {
+                        //     bookingsWithEmptyUsers.Add(id);
+                        // }
+                        // else if (usersToken is JArray usersArray && usersArray.Count == 0)
+                        // {
+                        //     bookingsWithEmptyUsers.Add(id);
+                        // }
                     }
                 }
             }
 
             Console.WriteLine($"Found {migratedBookings.Count} migrated bookings in {_config.TargetCollection}");
-            Console.WriteLine($"Found {bookingsWithEmptyUsers.Count} bookings with empty or null users field");
+            // Console.WriteLine($"Found {bookingsWithEmptyUsers.Count} bookings with empty or null users field");
 
             // Get all bookings from source collection with their updateTime
             var sourceQuery = $"SELECT id, updateTime FROM `{_config.BucketName}`.`{_config.Scope}`.`{_config.SourceCollection}`";
@@ -134,7 +135,7 @@ internal class BookingUpdateMigration
             
             int newBookingsCount = 0;
             int updatedBookingsCount = 0;
-            int emptyUsersCount = 0;
+            // int emptyUsersCount = 0;
             
             await foreach (var row in sourceResult)
             {
@@ -178,17 +179,19 @@ internal class BookingUpdateMigration
             }
             
             // Add bookings from target collection that have empty or null users
-            foreach (var bookingId in bookingsWithEmptyUsers)
-            {
-                if (!bookingIds.Contains(bookingId))
-                {
-                    Console.WriteLine($"📝 Booking {bookingId} needs update (empty or null users field)");
-                    bookingIds.Add(bookingId);
-                    emptyUsersCount++;
-                }
-            }
+            // foreach (var bookingId in bookingsWithEmptyUsers)
+            // {
+            //     if (!bookingIds.Contains(bookingId))
+            //     {
+            //         Console.WriteLine($"📝 Booking {bookingId} needs update (empty or null users field)");
+            //         bookingIds.Add(bookingId);
+            //         emptyUsersCount++;
+            //     }
+            // }
             
-            Console.WriteLine($"Found {newBookingsCount} new bookings, {updatedBookingsCount} updated bookings, and {emptyUsersCount} bookings with empty/null users to process (total: {bookingIds.Count})");            
+            // Console.WriteLine($"Found {newBookingsCount} new bookings, {updatedBookingsCount} updated bookings, and {emptyUsersCount} bookings with empty/null users to process (total: {bookingIds.Count})");   
+            Console.WriteLine($"Found {newBookingsCount} new bookings, {updatedBookingsCount} updated bookings to process (total: {bookingIds.Count})");            
+         
         }
         catch (Exception ex)
         {
@@ -314,7 +317,9 @@ internal class BookingUpdateMigration
             {
                 Console.WriteLine($" ** Booking has no tmura");
             }
+            booking["users"] = new JArray();
             EnsureNewFieldsExist(booking);
+            UpdateHotelProductDetailsDates(booking);
             return (booking, false);
         }
         
@@ -357,12 +362,83 @@ internal class BookingUpdateMigration
         // Ensure new fields exist with defaults
         EnsureNewFieldsExist(booking);
         
+        // Update hotel productDetails start and end from rooms
+        UpdateHotelProductDetailsDates(booking);
+        
         // Check and update computed values
         hasMismatches = CheckAndUpdateComputedValues(booking, user, bookingId);
         
         Console.WriteLine($"  ✅ Created Users array with 1 user (Key: {ownerKey})");
         
         return (booking, hasMismatches);
+    }
+
+    private void UpdateHotelProductDetailsDates(JObject booking)
+    {
+        var products = booking["products"] as JArray;
+        if (products == null) return;
+
+        foreach (var product in products)
+        {
+            var productDetails = product["productDetails"] as JObject;
+            if (productDetails == null) continue;
+
+            // Check if this is a hotel product (type = 0)
+            var type = productDetails["type"]?.Value<int>();
+            if (type != 0) continue;
+
+            var rooms = productDetails["rooms"] as JArray;
+            if (rooms == null || rooms.Count == 0) continue;
+
+            DateTime? minStart = null;
+            DateTime? maxEnd = null;
+
+            // Find minimum start and maximum end from all rooms
+            foreach (var room in rooms)
+            {
+                if (room is JObject roomObj)
+                {
+                    // Get start date from room
+                    var roomStart = roomObj["start"];
+                    if (roomStart != null && roomStart.Type != JTokenType.Null)
+                    {
+                        if (DateTime.TryParse(roomStart.ToString(), out var startDate))
+                        {
+                            if (!minStart.HasValue || startDate < minStart.Value)
+                            {
+                                minStart = startDate;
+                            }
+                        }
+                    }
+
+                    // Get end date from room
+                    var roomEnd = roomObj["end"];
+                    if (roomEnd != null && roomEnd.Type != JTokenType.Null)
+                    {
+                        if (DateTime.TryParse(roomEnd.ToString(), out var endDate))
+                        {
+                            if (!maxEnd.HasValue || endDate > maxEnd.Value)
+                            {
+                                maxEnd = endDate;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Set start and end in productDetails
+            if (minStart.HasValue)
+            {
+                productDetails["start"] = minStart.Value.ToString("yyyy-MM-dd");
+                Console.WriteLine($"  📅 Set hotel productDetails.start to {productDetails["start"]} (min from rooms)");
+            }
+
+            if (maxEnd.HasValue)
+            {
+                productDetails["end"] = maxEnd.Value.ToString("yyyy-MM-dd");
+                Console.WriteLine($"  📅 Set hotel productDetails.end to {productDetails["end"]} (max from rooms)");
+            }
+        }
     }
 
     private bool CheckAndUpdateComputedValues(JObject booking, JObject user, uint bookingId)
