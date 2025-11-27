@@ -1,4 +1,7 @@
-﻿namespace NewBookingMigration;
+﻿using Couchbase;
+using Newtonsoft.Json.Linq;
+
+namespace NewBookingMigration;
 
 class Program
 {
@@ -18,6 +21,8 @@ class Program
         InitializeLoggingDirectory();
         await RunBookingUpdateMigrationAsync();
         // await RunGroupBillingBookingMigrationAsync();
+        await UpdateIdCounterAsync(TARGET_COLLECTION);
+        
     }
     private static void InitializeLoggingDirectory()
     {
@@ -99,6 +104,87 @@ class Program
         catch (Exception ex)
         {
             Console.WriteLine($"Booking update migration failed: {ex.Message}");
+            Console.WriteLine($"Stack trace: {ex.StackTrace}");
+        }
+    }
+
+    private static async Task UpdateIdCounterAsync(string collectionName)
+    {
+        try
+        {
+            Console.WriteLine($"\n🔢 Updating ID counter for {collectionName}...");
+            
+            // Initialize Couchbase connection
+            var cluster = await Cluster.ConnectAsync(CONNECTION_STRING, options =>
+            {
+                options.UserName = USERNAME;
+                options.Password = PASSWORD;
+                options.EnableTls = true;
+                options.EnableDnsSrvResolution = true;
+                options.KvCertificateCallbackValidation = (sender, certificate, chain, sslPolicyErrors) => true;
+                options.HttpCertificateCallbackValidation = (sender, certificate, chain, sslPolicyErrors) => true;
+            });
+            
+            var bucket = await cluster.BucketAsync(BUCKET_NAME);
+            await bucket.WaitUntilReadyAsync(TimeSpan.FromSeconds(10));
+            
+            // Query to get the maximum booking ID from the target collection
+            var maxIdQuery = $"SELECT MAX(id) as maxId FROM `{BUCKET_NAME}`.`{SCOPE}`.`{collectionName}`";
+            var maxIdResult = await cluster.QueryAsync<JObject>(maxIdQuery);
+            
+            uint maxId = 0;
+            await foreach (var row in maxIdResult)
+            {
+                if (row != null)
+                {
+                    var maxIdToken = row["maxId"];
+                    if (maxIdToken != null && maxIdToken.Type != JTokenType.Null)
+                    {
+                        maxId = maxIdToken.Value<uint>();
+                    }
+                }
+            }
+            
+            Console.WriteLine($"📊 Highest booking ID in collection: {maxId}");
+            
+            // Get current counter value from the target collection
+            var scopeObj = await bucket.ScopeAsync(SCOPE);
+            var collection = await scopeObj.CollectionAsync(collectionName);
+            
+            // Try to get the current counter document
+            var counterKey = "Counter";
+            
+            uint currentCounter = 0;
+            try
+            {
+                var counterResult = await collection.GetAsync(counterKey);
+                currentCounter = counterResult.ContentAs<uint>();
+                Console.WriteLine($"📊 Current counter value: {currentCounter}");
+            }
+            catch
+            {
+                Console.WriteLine("📊 No existing counter found, will create new one.");
+            }
+            
+            // Update counter to be equal to the max booking ID
+            var newCounterValue = Math.Max(currentCounter, maxId);
+            
+            if (newCounterValue > currentCounter)
+            {
+                await collection.UpsertAsync(counterKey, newCounterValue);
+                Console.WriteLine($"✅ Updated ID counter from {currentCounter} to {newCounterValue}");
+            }
+            else
+            {
+                Console.WriteLine($"✅ ID counter is already up to date (current: {currentCounter}, max booking ID: {maxId})");
+            }
+            
+            // Cleanup
+            await cluster.DisposeAsync();
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"⚠️  Failed to update ID counter: {ex.Message}");
             Console.WriteLine($"Stack trace: {ex.StackTrace}");
         }
     }
